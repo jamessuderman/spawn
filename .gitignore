@@ -1,0 +1,29 @@
+# Build directories
+build/
+build*/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Build artifacts
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.dll
+
+# Build logs
+build.log
+build.log.*
