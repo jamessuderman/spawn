@@ -28,9 +28,40 @@ if(SPAWN_BUILD_STANDALONE)
 
     juce_generate_juce_header(SpawnStandalone)
 
+    # Embedded assets (fonts, icons, licences).
+    # Add new files here as the project grows.
+    juce_add_binary_data(SpawnAssets
+        SOURCES
+            resources/fonts/PublicSans-Regular.ttf
+            resources/fonts/PublicSans-SemiBold.ttf
+            resources/icons/lucide/settings.svg
+            resources/icons/lucide/sliders-horizontal.svg
+            resources/icons/lucide/square-stack.svg
+            resources/icons/lucide/activity.svg
+            resources/icons/lucide/audio-lines.svg
+            resources/icons/lucide/x.svg
+            resources/icons/lucide/unfold-horizontal.svg
+            resources/icons/lucide/chart-gantt.svg
+            resources/licences/LICENCE-PublicSans.md
+            resources/licences/LICENCE-Lucide.md)
+
     target_sources(SpawnStandalone
         PRIVATE
-            src/Main.cpp)
+            src/Main.cpp
+            src/controlheader/ControlHeader.cpp
+            src/controlheader/DisplayButton.cpp
+            src/display/Display.cpp
+            src/sequencer/SequencerView.cpp
+            src/settings/PropertyRow.cpp
+            src/settings/SettingsView.cpp
+            src/settings/ThemeColorSwatch.cpp
+            src/stores/SettingsStore.cpp
+            src/ui/fonts/Fonts.cpp
+            src/ui/icons/Icon.cpp
+            src/ui/icons/Icons.cpp
+            src/ui/lookandfeel/Palette.cpp
+            src/ui/lookandfeel/SpawnLookAndFeel.cpp
+            src/waveform/WaveformView.cpp)
 
     target_compile_definitions(SpawnStandalone
         PRIVATE
@@ -40,6 +71,11 @@ if(SPAWN_BUILD_STANDALONE)
     target_link_libraries(SpawnStandalone
         PRIVATE
             juce::juce_gui_basics
+            juce::juce_gui_extra
+            juce::juce_audio_basics
+            juce::juce_audio_formats
+            juce::juce_audio_utils
+            SpawnAssets
         PUBLIC
             juce::juce_recommended_config_flags
             juce::juce_recommended_lto_flags

@@ -11,7 +11,7 @@ Three themes to choose from. Pick one for v1.
 ### A. Ink (recommended)
 
 - **Palette**: Deep ink `#0E0F12`, bone `#E8E6E1`, ember accent `#FF5C2E`.
-- **Type**: Inter (UI), JetBrains Mono (technical readouts).
+- **Type**: Public Sans (UI), Public Sans (technical — no mono in v1).
 - **Texture**: Subtle film grain, no gradients.
 - **Mood**: Underground, modern, confident. Works well in any DAW.
 
@@ -62,8 +62,19 @@ Main window regions (1440×900 reference, scaled responsively):
 
 Reusable component library (designer + engineer):
 
+- `WaveEditorStack` — top-level waveform container. Owns an `Overview`
+  strip above a `Main` editor.
+  - **Overview**: 50 px tall, full sample, navigation/scrub. Always shows
+    the entire waveform (no zoom window). No drop target.
+  - **Main**: 200 px tall, working area. Zoom, pan, and slice markers live
+    here. Accepts drag-and-drop of audio files.
+  - Vertical gap: 4 px. Outer margins: 24 px horizontal, 24 px top, none
+    on the bottom. Both strips have a 4 px corner radius.
+- `WaveformView` — single Mimic-style waveform strip. Filled-from-centre
+  mono waveform over a panel one shade brighter than Ink; ember `#FF5C2E`
+  fill at full opacity. Background path is a `Path::addRoundedRectangle`
+  with radius 4 px; the waveform and border are clipped to it.
 - `Pad` — chunky pad, 80×80, click → trigger, hover → preview, right-click → menu.
-- `WaveformView` — zoomable, with slice markers, drag-to-set-slice.
 - `EnvelopeView` — AHDSR editor, drag handles.
 - `Knob` — rotary, value display, MIDI learn support.
 - `Slider` — linear / rotary switch.
@@ -72,18 +83,62 @@ Reusable component library (designer + engineer):
 - `FXModule` — title, on/off, params.
 - `Browser` — tree + preview + drag-drop.
 
+## Waveform Display — Mimic-style (v1)
+
+Modelled after the Reason 14 Mimic Waveform Display. Two stacked strips
+inside a 4 px corner radius panel, both tinted `Ember` (`#FF5C2E`) on the
+Ink background.
+
+```
+┌────────────────────────────────────────────────────────┐ ← 24 px top
+│ Overview  (50 px, full sample, no drop target)        │
+│ ── 4 px gap ──────────────────────────────────────── │
+│ Main     (200 px, working area, drop target)          │
+│ (no bottom margin — strips end and the page bg takes │
+│  over below)                                          │
+└────────────────────────────────────────────────────────┘
+       24 px on each side                                24 px on each side
+```
+
+- **Visual**: filled-from-centre mono waveform (`AudioThumbnail::drawChannel`
+  channel 0). Stereo files render as mono to match Mimic's manual
+  explicitly: *"the waveform will always be displayed as a mono signal."*
+- **Drop target**: only the main editor.
+  `WaveformView::isInterestedInFileDrag` returns false unless
+  `Mode::Main`. The overview mirrors the main editor's audio source via
+  `setPartnerView()`.
+- **Accepted formats**: `.wav .aif .aiff .mp3 .flac .ogg .oga .opus`
+  via `AudioFormatManager::registerBasicFormats()`.
+- **Background panel**: `kInColour.brighter(0.04f)` fill, hairline
+  `kInColour`'s bone at ~12% opacity. 4 px corner radius on every panel.
+- **Empty state**: main editor shows "Drop an audio file here" in bone at
+  40% alpha. Overview stays blank until a file is loaded.
+- **Hover / drag affordance**: none in v1. Rely on the cursor change and
+  the obvious drop target. (Future: OS drag-hover detection via
+  `DragAndDropManager`.)
+
 ## Iconography
 
-- 24×24 base size, monoline, custom-drawn.
-- Custom icon font generated from SVG sources.
-- Library: Settings, Master, Slice, Slice Edit, Sequencer, Mixer, FX, Browser, Modulation, MIDI, Sync, Slice.
+- 24×24 base size, monoline.
+- **Lucide** (ISC) — chosen for v1. SVG parsed via `juce::Drawable::createFromImageData`,
+  cached per `(icon, pixelSize)`, tinted at paint time via
+  `Drawable::replaceColour` (Lucide's `stroke="currentColor"` resolves to
+  black inside `lunasvg`).
+- v1 subset: Settings, Sliders-horizontal, Square-stack, Activity. More land
+  as the UI fills out (transport, pads, FX, browser).
 
 ## Typography
 
-- **Display**: Inter Bold 24-32 px
-- **UI**: Inter Regular 14 px
-- **Technical**: JetBrains Mono 12 px (BPM, position, sample length)
-- **Section titles**: Inter Semi-Bold 16 px, uppercase, letter-spacing +2%
+Public Sans (SIL OFL), Regular + SemiBold. Bundled as TTF and loaded via
+`Fonts::typeface()`. The whole app routes through one `LookAndFeel_V4`
+subclass (`SpawnLookAndFeel`) so every `Font` request resolves to Public Sans
+without touching call sites.
+
+- **Display**: Public Sans SemiBold 32 px
+- **UI**: Public Sans Regular 14 px
+- **Technical**: Public Sans Regular 12 px (BPM, position, sample length —
+  no mono in v1)
+- **Section titles**: Public Sans SemiBold 16 px, uppercase, letter-spacing +2%
 
 ## Accessibility
 
@@ -108,11 +163,17 @@ Reusable component library (designer + engineer):
 
 ## Open UI questions
 
-1. **Theme**: A (Ink), B (Forge), or C (Pulse)? *(Recommend A)*
+1. **Theme**: A (Ink) — locked in for v1.
 2. **Pad grid size**: fixed 4×4, or configurable (4×4 / 4×8 / 8×8)?
-3. **Default waveform height**: 200 px, 240 px, or proportional?
+3. **Default waveform height**: **200 px main, 50 px overview** — locked in.
 4. **Sequencer**: toggle inside Sampler tab, or separate top-level tab?
 5. **Browser location**: left sidebar vs popup vs separate top-level?
 6. **Pad shape**: square / round / hex? *(Recommend square for v1)*
 7. **Pad lighting on trigger**: flash only vs color change vs both?
 8. **Micro-timing UI**: visible nudge per cell, or hidden behind a key modifier?
+9. **Typography**: Public Sans Regular + SemiBold — locked in.
+10. **Iconography**: Lucide SVG (4 icons bundled for M1) — locked in.
+11. **Waveform zoom interaction**: click-and-drag-down to zoom a region
+    (Mimic), scroll-wheel to zoom centred on cursor, or both?
+12. **OS drag-hover affordance**: should we add a border highlight when an
+    audio file is being dragged over the main editor?

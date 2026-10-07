@@ -115,7 +115,31 @@ Two products, one core. The **Spawn Core** is a static library that holds the au
 
 ### `ui/`
 
-- `MainWindow` — root window
+The UI layer is a flat `src/ui/` namespace. Every component lives behind
+`spawn::ui::*`. Layout and geometry constants live with the component that
+uses them, not in `Main.cpp`.
+
+- `Fonts` *(Fonts.h/cpp)* — Public Sans Typeface cache (`Regular`,
+  `SemiBold`). Loaded from `BinaryData` once at `Fonts::initialise()` and
+  released by `Fonts::shutdown()` before process teardown.
+- `Icons` *(Icons.h/cpp)* — Lucide SVG cache. `Icons::Id` enum maps to
+  `BinaryData::...svg` blobs. Tinted at paint time via
+  `Drawable::replaceColour` (lunasvg resolves `currentColor` to its
+  layout state's `m_color`, which defaults to black — see
+  `third_party/JUCE/modules/juce_graphics/drawables/lunasvg/source/svglayoutstate.h:78`).
+- `SpawnLookAndFeel` *(SpawnLookAndFeel.h/cpp)* — `LookAndFeel_V4` subclass
+  routing every `Font` request to Public Sans. Sets Ink/Bone defaults on
+  the standard colour IDs.
+- `WaveformView` *(WaveformView.h/cpp)* — single waveform strip with two
+  modes (`Main`, `Overview`). Owns an `AudioFormatManager`,
+  `AudioThumbnailCache`, `AudioThumbnail`. `Main` accepts file drops;
+  `Overview` mirrors via `setPartnerView`. 4 px rounded panel.
+- `WaveEditorStack` *(WaveEditorStack.h/cpp)* — owns one overview + one
+  main editor, wires the partner, lays out the top of the window. The window
+  host (`MainWindow`) only knows about this single component.
+
+Planned (later milestones):
+
 - `SamplerView` — waveform + pad grid + slice map
 - `SliceEditor` — per-slice envelope, pitch, pan, FX
 - `SequencerView` — step grid + track lanes
@@ -124,6 +148,34 @@ Two products, one core. The **Spawn Core** is a static library that holds the au
 - `BrowserView` — samples, presets, kits
 - `TransportBar` — play/stop, BPM, position, sync
 - `ModulationMatrixView` (stretch) — LFO + source/dest routing
+
+#### UI shutdown teardown order
+
+`HelloWorldApp::shutdown` runs in this strict order:
+
+1. `LookAndFeel::setDefaultLookAndFeel(nullptr)` — so no component still
+   references our L&F.
+2. Destroy the main window (any in-flight paint finishes).
+3. Destroy the `SpawnLookAndFeel` itself.
+4. `Icons::shutdown()` — clear the `unique_ptr<Drawable>` map while the
+   `LookAndFeel` it tints against is still alive.
+5. `Fonts::shutdown()` — null the static `Typeface::Ptr` slots while the
+   `TypefaceCache` is still alive.
+
+If we let the function-local statics in `Icons::cache()` and
+`Fonts::typeface()` get destroyed at static-destruction time (after
+`main()`), they touch JUCE globals — `MessageManager`, `TypefaceCache`,
+internal `std::list`s — that have already been torn down. On Windows
+that surfaced as `list erase iterator outside range`. Doing the clear
+inside `shutdown()` keeps the destruction inside JUCE's lifetime.
+
+#### Embedded resources (`juce_add_binary_data`)
+
+The `SpawnAssets` target in `CMakeLists.txt` embeds fonts, icons, and
+licence files into the executable as `BinaryData::name_*` symbols,
+generated at `${CMAKE_BINARY_DIR}/juce_binarydata_SpawnAssets/JuceLibraryCode/BinaryData.h`.
+Drop new files into `resources/` and add them to the `SOURCES` list of
+`juce_add_binary_data(SpawnAssets …)` to make them available at runtime.
 
 ### `plugin/`
 

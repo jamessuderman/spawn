@@ -1,0 +1,73 @@
+// Spawn — Palette.
+// Single source of truth for every colour the UI uses. Holds the active
+// palette and broadcasts changes through a ChangeBroadcaster so any
+// component that caches one (DisplayButton, WaveformView, ...) can repaint
+// when a colour changes.
+//
+// Persistence is delegated to SettingsStore. The Palette is constructed
+// from a SettingsStore and re-saves into one whenever setPrimary() (or any
+// future setter) is called. This keeps the file-format concern out of
+// the UI layer.
+
+#pragma once
+
+#include <JuceHeader.h>
+
+namespace spawn::ui {
+
+class SettingsStore;
+
+class Palette : public juce::ChangeBroadcaster {
+public:
+    // Defaults — the "Ember" palette documented in UI.md § A.
+    static constexpr juce::uint32 kDefaultPrimary    = 0xFFFF5C2E; // Ember
+    static constexpr juce::uint32 kDefaultInk        = 0xFF0E0F12; // Ink (window + panel base)
+    static constexpr juce::uint32 kDefaultPanelFill  = 0xFF0E0F12; // brighter(0.04f) — derived at runtime
+    static constexpr juce::uint32 kDefaultBorderIdle = 0x1FE8E6E1; // Bone @ 12%
+    static constexpr juce::uint32 kDefaultPlaceholder= 0x66E8E6E1; // Bone @ 40%
+    static constexpr juce::uint32 kDefaultBodyText   = 0xCCE8E6E1; // Bone @ 80%
+    static constexpr juce::uint32 kDefaultLabelText  = 0xFFE8E6E1; // Bone @ 100%
+    static constexpr juce::uint32 kDefaultButtonIdle = 0xCCE8E6E1; // Bone @ 80% (icon tint at rest)
+
+    // Take the values from `store`; on construction, fall back to the
+    // defaults above if the store has nothing recorded. The store pointer
+    // is retained so every setter writes through to disk.
+    explicit Palette(SettingsStore& store);
+
+    juce::Colour primary()    const noexcept { return primaryColour; }
+    juce::Colour ink()        const noexcept { return inkColour; }
+    juce::Colour panelFill()  const noexcept { return panelFillColour; }
+    juce::Colour borderIdle() const noexcept { return borderIdleColour; }
+    juce::Colour placeholder()const noexcept { return placeholderColour; }
+    juce::Colour bodyText()   const noexcept { return bodyTextColour; }
+    juce::Colour labelText()  const noexcept { return labelTextColour; }
+    juce::Colour buttonIdle() const noexcept { return buttonIdleColour; }
+    // Bone @ 12% — same as borderIdle(). Used for waveform regions outside
+    // the active chop (before the start marker, after the end marker) so
+    // the deactivated portions read as grey outline, matching the panel
+    // border tone.
+    juce::Colour muted()      const noexcept { return mutedColour; }
+    // Bone at high opacity — used for chop marker lines.
+    juce::Colour marker()     const noexcept { return markerColour; }
+
+    // Setters. Each notifies listeners and persists through SettingsStore.
+    void setPrimary(juce::Colour c);
+
+private:
+    SettingsStore& store;
+
+    juce::Colour primaryColour    = juce::Colour(kDefaultPrimary);
+    juce::Colour inkColour        = juce::Colour(kDefaultInk);
+    juce::Colour panelFillColour  = juce::Colour(kDefaultInk).brighter(0.04f);
+    juce::Colour borderIdleColour = juce::Colour(kDefaultBorderIdle);
+    juce::Colour placeholderColour= juce::Colour(kDefaultPlaceholder);
+    juce::Colour bodyTextColour   = juce::Colour(kDefaultBodyText);
+    juce::Colour labelTextColour  = juce::Colour(kDefaultLabelText);
+    juce::Colour buttonIdleColour = juce::Colour(kDefaultButtonIdle);
+    juce::Colour mutedColour      = juce::Colour(kDefaultBorderIdle);
+    juce::Colour markerColour     = juce::Colour(kDefaultLabelText);
+
+    void load();
+};
+
+} // namespace spawn::ui

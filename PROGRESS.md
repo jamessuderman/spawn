@@ -1,24 +1,29 @@
 # Spawn — Progress
 
-## Status: planning (no code yet)
+## Status: M1 in progress
 
-The four planning docs are written. We now need your decisions on the open questions below, then we start M0.
+M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, fonts, icons, drag-and-drop waveform view, and Mimic-style overview/main strip are in. Slice editing, sample decode-to-RAM, and project save/load are still ahead.
 
 ## Milestone breakdown
 
-### M0 — Project setup *(week 1)*
+### M0 — Project setup *(week 1)* ✅
 
-- [ ] Repo, CI, code style (clang-format, clang-tidy)
-- [ ] JUCE + CMake integration
-- [ ] Standalone skeleton (JUCE AudioDeviceManager)
-- [ ] VST3 skeleton (JUCE AudioProcessor)
-- [ ] Hello-world sine-wave passes through
+- [x] Repo, CI, code style (clang-format, clang-tidy)
+- [x] JUCE + CMake integration (vendored submodule at `third_party/JUCE`)
+- [x] Standalone skeleton (`SpawnStandalone` target, dark Ink window)
+- [ ] VST3 skeleton (JUCE AudioProcessor) — deferred to M8
+- [ ] Hello-world sine-wave passes through — replaced by M1's waveform UI
+- [x] Public Sans (Regular + SemiBold) loaded via `Fonts::initialise()`
+- [x] Lucide icons (4-file subset) loaded via `BinaryData`
+- [x] Shutdown-order fix: asset caches cleared inside `JUCEApplication::shutdown()`
+  (function-local statics were being torn down against torn-down JUCE globals;
+  causing a `list erase iterator outside range` abort on Windows)
 
-### M1 — Sample loader *(week 2)*
+### M1 — Sample loader *(week 2)* 🟡
 
-- [ ] Drag-drop import (WAV, AIFF, MP3, FLAC, OGG, OPUS)
-- [ ] Decoded-to-RAM sample buffer
-- [ ] Basic waveform display (zoom, pan)
+- [x] Drag-drop import (WAV, AIFF, MP3, FLAC, OGG, OPUS via `AudioFormatManager::registerBasicFormats()`)
+- [ ] Decoded-to-RAM sample buffer (thumbnails only for now; no playback)
+- [ ] Basic waveform display with zoom/pan (overview strip exists; main view shows the full sample)
 - [ ] Project save/load (JSON)
 
 ### M2 — Slicer + pad grid *(week 3-4)*
@@ -88,23 +93,29 @@ The four planning docs are written. We now need your decisions on the open quest
 ## Decisions log
 
 - **Framework**: JUCE 8 — see PROJECT.md § Tech stack.
+- **Brand direction**: **A. Ink** (`#0E0F12` background, `#E8E6E1` text, `#FF5C2E` ember accent). Locked in for v1.
+- **Typography**: **Public Sans** (SIL OFL), Regular for body, SemiBold for titles. Bundled as TTF in `resources/fonts/` and embedded via `juce_add_binary_data`. Italic and JetBrains Mono dropped from v1 scope.
+- **Iconography**: **Lucide** (ISC), SVG files embedded via `BinaryData`. Subset for M1: `settings`, `sliders-horizontal`, `square-stack`, `activity`. Tintable at paint time via `Drawable::replaceColour`; `currentColor` resolves to black in `lunasvg` (see `third_party/JUCE/modules/juce_graphics/drawables/lunasvg/source/svglayoutstate.h:78`).
+- **Waveform look**: Mimic-style filled-from-centre **mono** waveform over the Ink background, drawn with `AudioThumbnail::drawChannel` (channel 0). Stereo files stack L on top, bottom on the bottom — but we currently always render channel 0 to match Mimic's explicit "displayed as mono" behaviour.
+- **Waveform layout**: `WaveEditorStack` owns an `Overview` strip (50 px, navigation) above the `Main` editor (200 px, working area). 4 px vertical gap, 24 px outer horizontal padding, 24 px top padding, no bottom padding. Both strips have a 4 px corner radius.
+- **Drag-and-drop**: only the main editor accepts drops (`WaveformView::isInterestedInFileDrag` returns false unless `Mode::Main`). The overview mirrors the main editor's audio source via `setPartnerView()`.
+- **Shutdown order** (locked in `HelloWorldApp::shutdown`): detach `LookAndFeel` → destroy window → destroy `LookAndFeel` → `Fonts::shutdown()` / `Icons::shutdown()` before `MainWindow` exits, so cached `Drawable`s / `Typeface::Ptr`s are torn down while JUCE globals are still alive.
 - **Time-stretch**: TBD (Rubber Band default).
 - **Transient detection**: aubio (BSD).
-- **Brand direction**: TBD (Ink / Forge / Pulse).
 - **License (source)**: TBD (MIT / dual).
 - **License (product)**: TBD (free / freemium / one-time / subscription).
 - **Open-source model**: TBD.
 
 ## Open questions (need your decision)
 
-1. **Brand direction** (UI.md § Design directions) — Ink, Forge, or Pulse?
-2. **Time-stretch engine** — Rubber Band, ZTX, or DIY phase vocoder?
-3. **Source license** — MIT, MIT + closed packs, or full closed?
-4. **Product license model** — free, freemium, one-time, or subscription?
-5. **Linux** — ship in v1 or later?
-6. **AIWARP** — v1 or v2?
-7. **Song mode** — v1 or v2?
-8. **Audio-to-MIDI / beat assist** — v1 or v2?
+1. **Time-stretch engine** — Rubber Band, ZTX, or DIY phase vocoder?
+2. **Source license** — MIT, MIT + closed packs, or full closed?
+3. **Product license model** — free, freemium, one-time, or subscription?
+4. **Linux** — ship in v1 or later?
+5. **AIWARP** — v1 or v2?
+6. **Song mode** — v1 or v2?
+7. **Audio-to-MIDI / beat assist** — v1 or v2?
+8. **Waveform zoom interaction** — click-and-drag-down to zoom a region (Mimic), scroll-wheel to zoom centred on cursor, or both? (Resolved when we wire M1's zoom/pan.)
 
 ## Ideas backlog (v2+)
 

@@ -83,13 +83,21 @@ Spawn/
 ├── UI.md
 ├── PROGRESS.md
 ├── src/
-│   ├── core/                   # Core models, project state
-│   ├── audio/                  # Audio engine (RT-safe)
-│   ├── dsp/                    # DSP primitives
+│   ├── core/                   # Core models, project state        (planned)
+│   ├── audio/                  # Audio engine (RT-safe)            (planned)
+│   ├── dsp/                    # DSP primitives                    (planned)
 │   ├── ui/                     # UI (non-RT)
-│   ├── plugin/                 # VST3 entry point
+│   │   ├── Fonts.{h,cpp}       # Public Sans Typeface cache
+│   │   ├── Icons.{h,cpp}       # Lucide SVG cache
+│   │   ├── SpawnLookAndFeel.{h,cpp}  # Public Sans + Ink look-and-feel
+│   │   ├── WaveformView.{h,cpp}      # Single Mimic-style strip
+│   │   └── WaveEditorStack.{h,cpp}   # Overview + Main layout
+│   ├── plugin/                 # VST3 entry point                  (planned)
 │   └── standalone/             # Standalone entry point
-├── resources/                  # Bundled samples, IRs, fonts, icons
+├── resources/                  # Bundled assets (embedded via juce_add_binary_data)
+│   ├── fonts/                  # PublicSans-Regular.ttf, PublicSans-SemiBold.ttf
+│   ├── icons/lucide/           # *.svg
+│   └── licences/               # SIL OFL + ISC notices
 ├── tests/
 ├── third_party/                 # Vendored (juce, aubio, rubberband)
 └── tools/                      # bundler, prebuild scripts
@@ -119,4 +127,14 @@ Spawn/
 3. **Linux**: ship in v1 or later?
 4. **AIWARP**: ship in v1 or v2?
 5. **License model** (end-user product): free / freemium / one-time / subscription?
-6. **Brand direction** (see UI.md): Ink / Forge / Pulse?
+
+## Locked-in decisions
+
+These are already decided and shipped in M0/M1; see UI.md and PROGRESS.md for context.
+
+- **Brand direction**: **A. Ink** (`#0E0F12` background, `#E8E6E1` text, `#FF5C2E` ember accent).
+- **Typography**: **Public Sans** (SIL OFL), Regular + SemiBold. Italic and a technical mono dropped from v1.
+- **Iconography**: **Lucide** (ISC), SVG subset (Settings, Sliders-horizontal, Square-stack, Activity for M1).
+- **Waveform**: Mimic-style filled-from-centre mono, ember fill, two stacked strips (overview 50 px + main 200 px), 4 px corner radius, only the main editor accepts drops.
+- **Asset embedding**: `juce_add_binary_data(SpawnAssets …)` in `CMakeLists.txt`; resources live in `resources/`. New files must be added to the `SOURCES` list to be exposed via `BinaryData`.
+- **Shutdown order**: `LookAndFeel::setDefaultLookAndFeel(nullptr)` → window → L&F → `Icons::shutdown()` → `Fonts::shutdown()`. Done inside `HelloWorldApp::shutdown` to avoid `list erase iterator outside range` aborts on Windows.
