@@ -25,6 +25,8 @@ public:
         FolderOpen,
         Save,
         Pencil,
+        Scan,
+        Crop,
     };
 
     // Parse and cache the icon at the requested pixel size.

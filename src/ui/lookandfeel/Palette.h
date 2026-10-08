@@ -20,7 +20,18 @@ class SettingsStore;
 class Palette : public juce::ChangeBroadcaster {
 public:
     // Defaults — the "Ember" palette documented in UI.md § A.
-    static constexpr juce::uint32 kDefaultPrimary    = 0xFFFF5C2E; // Ember
+//
+// Colour role split (full table in UI.md § Cursor colour rules):
+//   primary  → transient cues (interacts with the user right now)
+//   marker   → boundary lines (durably part of the chop / loop state)
+//   playhead → playback position (mid-tone, distinct from both)
+//   muted    → deactivated waveform outside the active region
+//   bodyText / labelText / buttonIdle → typography + iconography
+//
+// New uses should pick the role first, then the colour. Resist
+// reaching for primary() when something is a structural element —
+// leave that to marker().
+    static constexpr juce::uint32 kDefaultPrimary    = 0xFFFF5C2E; // Ember — transient cues (scissors cursor, knob value arc)
     static constexpr juce::uint32 kDefaultInk        = 0xFF0E0F12; // Ink (window + panel base)
     static constexpr juce::uint32 kDefaultPanelFill  = 0xFF0E0F12; // brighter(0.04f) — derived at runtime
     static constexpr juce::uint32 kDefaultBorderIdle = 0x1FE8E6E1; // Bone @ 12%
@@ -52,9 +63,15 @@ public:
     // the deactivated portions read as grey outline, matching the panel
     // border tone.
     juce::Colour muted()      const noexcept { return mutedColour; }
-    // Bone at high opacity — used for chop marker lines.
+    // Bone at high opacity — used for ALL boundary lines on the waveform:
+    // chop start/end markers, Scissors cuts, future loop markers. Boundary
+    // colour reads as durable and structural. See UI.md § Reference
+    // interactions / Cursor colour rules for the three-role split between
+    // marker (boundary) / primary (transient cue) / playhead (playback).
     juce::Colour marker()     const noexcept { return markerColour; }
     // Bone at 50% — used for the playback playhead line on the waveform.
+    // Mid-tone so it sits distinct from the boundary markers (100% bone)
+    // and the active chop fill (ember).
     juce::Colour playhead()   const noexcept { return playheadColour; }
 
     // Setters. Each notifies listeners and persists through SettingsStore.

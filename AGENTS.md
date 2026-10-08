@@ -46,6 +46,7 @@ Mavis keeps these in sync with reality as decisions land.
 - **Build artifacts**: not committed
 - **Code style**: clang-format (see `tools/.clang-format`)
 - **Tests**: Catch2; every DSP module has unit tests
+- **Build command**: `.\build.cmd debug` (or `release`) — this sources vcvarsall.bat so the RC step finds Windows.h. The CLion-bundled `cmake --preset=debug` fails at the RC step (UCRT/Windows.h not on the include path); the manual `build.cmd` script in repo root is the working build path. After adding a new icon to `SpawnAssets` SOURCES, also delete `build\debug-x64\SpawnAssets.dir\Debug\*.obj` (or just `Remove-Item -Recurse build\debug-x64\SpawnAssets.dir`) before re-running — stale BinaryData .obj files cause LNK1236 "corrupt or invalid COFF sections" link errors.
 
 ## What this file is for
 

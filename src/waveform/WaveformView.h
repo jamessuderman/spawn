@@ -14,25 +14,29 @@
 // indicator. The cursor over each marker on Main is the Lucide
 // "unfold-horizontal" icon so users see the grab affordance.
 //
-// Zoom and pan (Main only, Move tool):
+// Input (Main only):
 //   - Mouse wheel zooms in/out centred on the cursor, no modifier required.
 //   - Click-and-hold on the waveform background (not on a marker) and drag
-//     horizontally to pan the visible window.
+//     horizontally to pan the visible window, or vertically to zoom.
+//   - Dragging a marker moves it.
 //   - Double-click on the background resets zoom + pan to the full sample.
+//   - A short left-click on the background (release within ~4 px of the
+//     press point) starts preview playback of the active chop region
+//     through the supplied PreviewEngine. A short left-click on a marker
+//     does not start playback — clicks on a marker always arm a drag.
+//   - Right-click anywhere stops preview playback.
 //   - The viewport is clamped to [0, length] so panning can't go past either
 //     end, and zooming in stops at a 1 ms minimum visible window.
 //
-// Speaker tool: zoom, pan, marker drag, and double-click reset are all
-// disabled. Left-click plays the active region (startSeconds → endSeconds)
-// through the supplied PreviewEngine; right-click stops playback. A 1 px
-// playhead line in palette().playhead() tracks the engine position while
-// playing. The Timer drives 60 Hz repaints while playback is active.
+// A 1 px playhead line in palette().playhead() tracks the engine position
+// while playing. The Timer drives 60 Hz repaints while playback is active.
 
 #pragma once
 
 #include <JuceHeader.h>
 
 #include <memory>
+#include <vector>
 
 namespace spawn::audio { class PreviewEngine; }
 
@@ -49,9 +53,11 @@ public:
     // window. The main view honours its zoom window.
     enum class Mode { Main, Overview };
 
-    // The tool the host has latched. Drives the mouse-handler routing.
-    // Main only — Overview always behaves as Move for input.
-    enum class Tool { Move, Speaker, Scissors };
+    // The host-facing tool taxonomy. Today the view's input routing only
+    // diverges for Scissors (custom cursor + click-to-cut). Speaker is
+    // the default — pan, zoom, marker drag, and click-to-play are live
+    // regardless of which tool is latched.
+    enum class Tool { Speaker, Scissors };
 
     WaveformView(Palette& palette, Mode mode = Mode::Main);
     ~WaveformView() override;
@@ -69,9 +75,9 @@ public:
     // to unlink.
     void setPartnerView(WaveformView* other);
 
-    // Set the latched tool. The view re-routes its mouse handlers; passing
-    // a tool other than Move stops any in-progress drag and, if the tool
-    // is no longer Speaker, also stops preview playback.
+    // Set the latched tool. Only Scissors changes input handling; the
+    // tool is otherwise cosmetic from the view's perspective. Calling
+    // this with the same tool that's already active is a no-op.
     void setActiveTool(Tool tool);
 
     // Set the preview engine. The view reads isPlaying() and
@@ -86,12 +92,50 @@ public:
     using OnFileLoaded = std::function<void(const juce::File&)>;
     void setOnFileLoaded(OnFileLoaded handler);
 
-    // Chop region in seconds. Both views expose these for the project to
-    // read; setting them on an Overview view is allowed (mirrors to partner
-    // if any) but Overview does not accept direct drag input.
+    // Chop region in seconds. The single-region model is a degenerate
+    // case of the cut-list model (no cuts → one slice). Both views
+    // expose the legacy single-region getters for the existing project
+    // code; setting them on an Overview view mirrors to the partner if
+    // any but Overview does not accept direct drag input.
     double getStartSeconds() const noexcept { return startSeconds; }
     double getEndSeconds()   const noexcept { return endSeconds; }
     void setChopRegion(double startSecondsToUse, double endSecondsToUse);
+
+    // Chop list — sorted sample-time positions of every internal cut.
+    // An empty list means the entire sample is one chop. A list with N
+    // entries defines N+1 chops. The endpoints (0 and length) are NOT
+    // included; they are implicit.
+    //
+    // Loading a new file clears the list; the initial state of the
+    // list after file load matches the existing single-region semantics
+    // (no internal cuts, just the legacy start/end pair).
+    //
+    // getCuts() returns a sorted snapshot, suitable for the host to
+    // derive per-chop playback regions from.
+    std::vector<double> getCuts() const;
+
+    // Replace the entire cut list with `newCuts`. The view assumes
+    // the input is already sorted ascending and within (0, length);
+    // no dedup or clamping is applied. Used by the host to bulk-set
+    // the cut list after a destructive operation like trim that has
+    // already shifted/dropped cuts on the host side.
+    void setCuts(std::vector<double> newCuts);
+
+    // Add a cut at `seconds`, clamped to (0, length). Inserted into
+    // the sorted list; if a cut already exists within kMinChopGapSeconds
+    // the call is a no-op (so a user clicking rapidly on the same spot
+    // doesn't pile up zero-length regions). Returns true if a new cut
+    // was added, false if the call was dedup'd or the sample is empty.
+    bool addCut(double seconds);
+
+    // Resolve the chop containing `seconds` (sample time) into its
+    // [outStart, outEnd] bounds. A chop is bounded on the left by the
+    // previous cut (or 0) and on the right by the next cut (or the
+    // sample's length). Click playback routes through this so playing
+    // chop #N doesn't bleed into chop #N+1. If `seconds` is outside
+    // [0, length] the closest chop is returned and the result is
+    // treated as empty (start == end → caller should skip play).
+    void findChopAt(double seconds, double& outStart, double& outEnd) const;
 
     // Zoom window in seconds. Main only — Overview always draws the full
     // sample. Setting on an Overview view is a no-op (returns false).
@@ -139,8 +183,18 @@ private:
     WaveformView* partner = nullptr;
 
     // Chop region, in seconds. start <= end, both clamped to [0, length].
+    // Treated as a degenerate case of `cuts` (zero internal cuts → one
+    // continuous slice). UI-side, the existing draggable start/end
+    // markers still drive `startSeconds`/`endSeconds`; the cuts list
+    // represents additional internal boundaries.
     double startSeconds = 0.0;
     double endSeconds   = 0.0;
+
+    // Internal cut positions, sorted ascending, all in (0, length).
+    // Loaded sample → empty list (one continuous chop). Scissors tool
+    // inserts cuts here; the host reads via getCuts() to drive
+    // playback slicing per the chops.
+    std::vector<double> cuts;
 
     // Zoom window, in seconds. [zoomStart, zoomEnd] is what the Main view
     // currently shows. When zoomStart == 0 and zoomEnd == length, the view
@@ -151,6 +205,10 @@ private:
     // Active interaction (Main only). None means we're not dragging.
     enum class DragTarget { None, Start, End, Pan };
     DragTarget activeDrag = DragTarget::None;
+    // True once the press has moved past the click/click-to-play slack and
+    // the gesture is committed to being a drag. Until then, mouseUp starts
+    // preview playback. Main only.
+    bool dragCommitted = false;
 
     // Resolved axis of a background drag. We don't know whether a click-
     // and-hold on the waveform is meant to pan or zoom until the user has
@@ -183,13 +241,22 @@ private:
     // Marker line thickness, in pixels — matches the 1 px panel border.
     static constexpr float kMarkerThicknessPx = 1.0f;
 
-    // Active tool. Defaults to Move. Set by the host via setActiveTool.
-    Tool activeTool = Tool::Move;
-
     // Non-owning pointer to the preview engine. Read by the playhead
-    // painter and by Speaker-tool mouse handlers. May be nullptr if the
+    // painter and by the click-to-play gesture. May be nullptr if the
     // host hasn't set one up yet.
     spawn::audio::PreviewEngine* previewEngine = nullptr;
+
+    // Currently-latched tool. Speaker leaves input behaviour at the
+    // defaults; Scissors hides the OS cursor and routes left-click
+    // presses to addCut() instead of playFrom().
+    Tool activeTool = Tool::Speaker;
+
+    // Scissors cursor tracking. Painted by drawWaveform() (after the
+    // waveform, before the markers) as a 1 px ember line at full
+    // height when scissorsCursorActive is true. Updated from
+    // mouseMove.
+    int  scissorsCursorX = -1;          // component-local x in px, -1 = not over view
+    bool scissorsCursorActive = false;  // true while mouse is inside view in Scissors mode
 
     // File-loaded callback. The view does not own the audio engine,
     // so it forwards a notification here so the host can decode and
@@ -214,6 +281,12 @@ private:
     // Draws the playhead if previewEngine != nullptr and isPlaying() is
     // true. 1 px vertical line in palette().playhead() colour.
     void drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds);
+
+    // Draws the Scissors mode cursor: a 1 px vertical line in
+    // palette().primary() at the current mouse x, full height of the
+    // bounds. No-op when Scissors isn't active or the mouse isn't
+    // currently over the view.
+    void drawScissorsCursor(juce::Graphics& g, juce::Rectangle<int> bounds) const;
 
     // Visible-window seconds (Main = zoomStart/zoomEnd; Overview = 0/full).
     void visibleWindow(double& outStart, double& outEnd) const;

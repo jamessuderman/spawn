@@ -61,23 +61,35 @@ void Toolbar::setActiveTool(ToolHandle handle)
 
 void Toolbar::setAction(Icons::Id icon, OnActionClick onClick)
 {
+    // setAction preserves the single-slot contract: calling it removes
+    // any previously-added actions (including those added via
+    // addAction) and replaces them with this one. This matches the
+    // pre-existing call sites on Main.cpp and the documented
+    // "primary action per content view" intent.
     clearAction();
-    actionButton = std::make_unique<ToolButton>(icon, kToolIconSize, palette);
-    addAndMakeVisible(actionButton.get());
-    onActionClick = std::move(onClick);
-    actionButton->setOnClick([this] {
-        if (onActionClick)
-            onActionClick();
+    (void) addAction(icon, std::move(onClick));
+}
+
+ActionHandle Toolbar::addAction(Icons::Id icon, OnActionClick onClick)
+{
+    ActionEntry entry;
+    entry.button = std::make_unique<ToolButton>(icon, kToolIconSize, palette);
+    entry.onClick = std::move(onClick);
+    entry.index = static_cast<int>(actions.size());
+    addAndMakeVisible(entry.button.get());
+    entry.button->setOnClick([this, idx = entry.index] {
+        if (idx >= 0 && idx < static_cast<int>(actions.size())
+            && actions[idx].onClick)
+            actions[idx].onClick();
     });
-    hasAction = true;
+    actions.push_back(std::move(entry));
     resized();
+    return ActionHandle(entry.index);
 }
 
 void Toolbar::clearAction()
 {
-    actionButton.reset();
-    onActionClick = nullptr;
-    hasAction = false;
+    actions.clear();
     resized();
 }
 
@@ -103,8 +115,8 @@ void Toolbar::resized()
 
 void Toolbar::layoutButtons()
 {
-    // Left-to-right: tools in add-order, then a gap, then the optional
-    // action button pinned to the right edge.
+    // Left-to-right: tools in add-order, then a gap, then the action
+    // buttons pinned to the right edge in the order they were added.
     int x = kEdgeMargin;
     const int yCentre = getHeight() / 2;
     for (auto& t : tools)
@@ -115,12 +127,22 @@ void Toolbar::layoutButtons()
         x += b.getWidth() + kButtonGapPx;
     }
 
-    if (hasAction && actionButton != nullptr)
+    if (!actions.empty())
     {
-        const auto b = actionButton->getPreferredBounds();
-        actionButton->setBounds(getWidth() - b.getWidth() - kEdgeMargin,
-                                yCentre - b.getHeight() / 2,
-                                b.getWidth(), b.getHeight());
+        // Right-aligned stack: the first action gets the rightmost
+        // slot, the second sits to its left, etc. We walk the list
+        // right-to-left so the position math reads naturally.
+        int cursorX = getWidth() - kEdgeMargin;
+        for (auto it = actions.rbegin(); it != actions.rend(); ++it)
+        {
+            const auto b = it->button->getPreferredBounds();
+            cursorX -= b.getWidth();
+            it->button->setBounds(cursorX,
+                                  yCentre - b.getHeight() / 2,
+                                  b.getWidth(),
+                                  b.getHeight());
+            cursorX -= kButtonGapPx;
+        }
     }
 }
 

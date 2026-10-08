@@ -97,6 +97,97 @@ void PreviewEngine::stop()
     positionSamples.store(0, std::memory_order_release);
 }
 
+void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
+{
+    const int64_t total = totalSourceSamples.load(std::memory_order_acquire);
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    if (total <= 0 || rate <= 0.0)
+        return;
+
+    int64_t s = secondsToSourceSample(startSeconds, rate, total);
+    int64_t e = secondsToSourceSample(endSeconds,   rate, total);
+    if (e <= s)
+    {
+        // Degenerate slice: nothing to keep. We don't try to recover
+        // by clamping the ends; the host can call again with valid
+        // bounds. Stop the transport so a partial render doesn't leak.
+        stop();
+        return;
+    }
+
+    // Snapshot the current buffer; copy from it (no atomic publication
+    // needed here since we're on the message thread and only one of
+    // us is reading).
+    const auto bufferSnapshot = bufferRef.load(std::memory_order_acquire);
+    if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
+        return;
+
+    const int numChannels = bufferSnapshot->getNumChannels();
+    const int newLength   = static_cast<int>(e - s);
+
+    auto trimmed = std::make_shared<juce::AudioBuffer<float>>(
+        numChannels, newLength);
+
+    // Copy every channel's slice into the new buffer. We trust the
+    // AudioBuffer's bounds here because s and e were clamped to
+    // [0, total] by secondsToSourceSample, and the source buffer's
+    // numSamples is `total`.
+    for (int ch = 0; ch < numChannels; ++ch)
+        trimmed->copyFrom(ch, 0,
+                          *bufferSnapshot,
+                          ch, static_cast<int>(s),
+                          newLength);
+
+    // Publish the new buffer using the same atomic-swap pattern as
+    // setBuffer(). The old shared_ptr keeps the old buffer alive
+    // until the last in-flight audio render finishes on it.
+    bufferRef.store(trimmed, std::memory_order_release);
+    totalSourceSamples.store(newLength, std::memory_order_release);
+    sourceSampleRate.store(rate, std::memory_order_release);
+
+    // Reset transport to idle at the new buffer's start.
+    TransportState idle{};
+    idle.playing = false;
+    transport.store(idle, std::memory_order_release);
+    positionSamples.store(0, std::memory_order_release);
+}
+
+bool PreviewEngine::writeBufferToWav(const juce::File& dest) const
+{
+    const auto bufferSnapshot = bufferRef.load(std::memory_order_acquire);
+    if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
+        return false;
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    if (rate <= 0.0)
+        return false;
+
+    // WavAudioFormat writes 16-bit PCM by default. The trimmed file
+    // is internal (re-loaded by the WaveformView's AudioThumbnail)
+    // so bit depth is fine; if we ever need a higher-fidelity
+    // reload we can switch to a 24-bit or float writer here.
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::OutputStream> stream(dest.createOutputStream());
+    if (stream == nullptr)
+        return false;
+
+    // Builder-style options (the older positional createWriterFor is
+    // deprecated in current JUCE). The unique_ptr<OutputStream> is
+    // taken by reference; on success the writer takes ownership.
+    auto writer = wav.createWriterFor(
+        stream,
+        juce::AudioFormatWriterOptions{}
+            .withSampleRate(rate)
+            .withNumChannels(static_cast<int>(bufferSnapshot->getNumChannels()))
+            .withBitsPerSample(16));
+    if (writer == nullptr)
+        return false;
+
+    const bool ok = writer->writeFromAudioSampleBuffer(
+        *bufferSnapshot, 0, bufferSnapshot->getNumSamples());
+    writer->flush();
+    return ok;
+}
+
 void PreviewEngine::setGain(float newGain) noexcept
 {
     gain.store(juce::jlimit(0.0f, 1.0f, newGain), std::memory_order_relaxed);
@@ -114,6 +205,11 @@ double PreviewEngine::getCurrentPositionSeconds() const noexcept
         return 0.0;
     const int64_t s = positionSamples.load(std::memory_order_relaxed);
     return static_cast<double>(s) / rate;
+}
+
+bool PreviewEngine::hasBuffer() const noexcept
+{
+    return totalSourceSamples.load(std::memory_order_acquire) > 0;
 }
 
 void PreviewEngine::prepareToPlay(int samplesPerBlockExpected,

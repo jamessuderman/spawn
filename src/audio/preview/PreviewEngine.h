@@ -56,6 +56,30 @@ public:
     // next getNextAudioBlock outputs silence.
     void stop();
 
+    // Destructively replace the engine's buffer with the slice
+    // [startSeconds, endSeconds] of the current buffer. Stops
+    // playback, allocates a new stereo AudioBuffer of length
+    // (endSample - startSample) samples, copies the slice across
+    // every channel, and atomically publishes the new buffer. The
+    // transport resets to idle with the playhead parked at 0.
+    //
+    // Out-of-range / degenerate inputs short-circuit to a stop()
+    // without modifying the buffer:
+    //   - no buffer loaded (totalSourceSamples == 0)
+    //   - startSeconds >= endSeconds
+    //   - the resolved slice would be empty
+    //
+    // Synchronous; intended for the message thread (UI button).
+    void trimToRegion(double startSeconds, double endSeconds);
+
+    // Write the engine's current buffer out to a WAV file at the
+    // given path. Used by the host to materialise a trimmed buffer
+    // so the WaveformView's AudioThumbnail can reload it without
+    // re-decoding from disk. Returns true on success.
+    //
+    // Synchronous; intended for the message thread.
+    bool writeBufferToWav(const juce::File& dest) const;
+
     // Volume in [0, 1]. Atomic so the UI thread can update it without
     // locking. No smoothing is applied — a single-sample ramp on a
     // long-press is not worth the click risk for a single-click
@@ -66,6 +90,11 @@ public:
 
     bool isPlaying() const noexcept;
     double getCurrentPositionSeconds() const noexcept;
+
+    // True if a buffer has been loaded (setBuffer was called at least
+    // once with a non-empty buffer). Used by the host to gate UI
+    // actions that operate on the loaded audio.
+    bool hasBuffer() const noexcept;
 
     // juce::AudioSource -----------------------------------------------------
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override;

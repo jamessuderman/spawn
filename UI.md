@@ -140,6 +140,84 @@ without touching call sites.
   no mono in v1)
 - **Section titles**: Public Sans SemiBold 16 px, uppercase, letter-spacing +2%
 
+## Reference interactions (and what we copy from where)
+
+Spawn borrows specific gestures from MPC, Maschine, Mimic, and
+Battery. This section is the ledger — when a feature lands, the
+interaction source is named here so future contributors can find
+the convention without re-deriving it. The fuller per-product
+analysis lives in `PROJECT.md § Reference products and what we
+borrow from each`; this section is the UI-facing subset.
+
+### Cursor colour rules
+
+Three roles, three colours. New uses must pick the closest fit:
+
+| Role                                          | Palette token         | Where in code today                               |
+| --------------------------------------------- | --------------------- | ------------------------------------------------- |
+| Boundary lines (start/end/cut/loop markers)   | `palette().marker()`  | `WaveformView::drawMarkers`                       |
+| Transient cues (scissors cursor, knob arc, …) | `palette().primary()` | `WaveformView::drawScissorsCursor`, `Knob::paint` |
+| Playback playhead                             | `palette().playhead()`| `WaveformView::drawPlayhead`                      |
+
+Boundary colour is bone (markers) — reads as a durable line on
+the waveform. Transient colour is ember — reads as "happening now,
+but changes." Playback is a mid-tone — distinct from both. The
+split is enforced by the comment on `Palette::marker()` /
+`Palette::playhead()` in `ui/lookandfeel/Palette.h`.
+
+### Waveform area
+
+- **Vertical-drag-to-zoom on background**: from Mimic + Maschine.
+  Lives in `WaveformView::applyPan` (anchor at press time, drag
+  up zooms in, drag down zooms out).
+- **Wheel-zoom centred on cursor**: universally standard (DAWs
+  across the board). `WaveformView::mouseWheelMove`.
+- **Click-to-play on background**: Mimic — `previewEngine.playFrom`
+  on short click; drag past slack becomes a pan instead. 4 px slack
+  is the threshold.
+- **Click-to-cut, instant slice**: MPC. `WaveformView::mouseDown`
+  Scissors branch adds the cut on press even if the user then
+  drags.
+- **Custom cursor for Scissors (line instead of OS arrow)**: MPC
+  + Maschine both paint a vertical cue while the scissors mode is
+  active. Bone vs ember choice: ember (`primary`) because the line
+  represents an interactive gesture, not a boundary on the
+  waveform.
+- **Marker drag with grab-cursor**: Mimic. The Lucide
+  `unfold-horizontal` cursor over the start/end lines is the same
+  metaphor.
+
+### Toolbar affordance
+
+- **Tools-as-latched-buttons (vs. momentary)**: MPC. Click Speaker
+  / Scissors and they stay lit until another tool is picked. The
+  toolbar handles the latch logic; the view only learns the
+  current tool via `setActiveTool`.
+- **Speaker is the default**: matches Mimic's "you can always
+  preview by clicking the waveform" baseline. We never start in
+  Scissors even if the last tool was Scissors — switching to a new
+  file drops you back to Speaker so the click-to-play gesture is
+  always available when a sample first loads.
+- **Folder-open as an action, not a tool**: Mimic + Maschine both
+  treat file loading as a one-shot button rather than a latched
+  mode. Same rationale for Save on the Settings toolbar.
+
+### Conflicts in source material
+
+When two reference products disagree, this is what we pick:
+
+- **Mimic wins** for single-strip waveform editing (zoom, pan,
+  marker drag) — it's our closest cousin.
+- **MPC wins** for chops-and-pads behaviour — instant slice,
+  choke groups, 4×4 default.
+- **Maschine wins** for the sequencer and macro ecosystem
+  (stretch).
+
+The decision is per-feature; we document the pick in the feature's
+code-review/PR description and link back here. When the choice
+gets re-litigated, it goes in `PROGRESS.md § Decisions log` as a
+reversal.
+
 ## Accessibility
 
 - All controls have keyboard shortcuts (visible on hover).

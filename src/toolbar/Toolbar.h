@@ -37,6 +37,12 @@ private:
     int index_ = -1;
 };
 
+// Lightweight handle returned by addAction. Toolbar's action slots are
+// append-only — there is no public handle to update them, the host
+// just calls clearTools() to start over. We keep the same ToolHandle
+// shape (an int index) so future needs (disable, hide) have a path.
+using ActionHandle = ToolHandle;
+
 class Toolbar : public juce::Component {
 public:
     // Strip height — matches ControlHeader so the eye reads them as
@@ -67,11 +73,22 @@ public:
     // Pass an invalid handle to clear the active state.
     void setActiveTool(ToolHandle handle);
 
-    // Set the right-side action button. Pass std::nullopt (via the
-    // overload) to remove the current action button. Currently the
-    // action is single-slot — calling setAction again replaces the
-    // previous action.
+    // Primary right-side action button. Single-slot — calling setAction
+    // again replaces the previous action. Convenient for the most
+    // important content-level action (e.g. Open on the waveform view,
+    // Save on the settings view).
     void setAction(Icons::Id icon, OnActionClick onClick);
+
+    // Append an additional right-side action button. Actions stack from
+    // the right edge outward: the FIRST action (whether placed via
+    // setAction or addAction) sits at the rightmost position, the
+    // second sits to its left, etc. Add then set adds them in that
+    // visual order. Used when a content view needs more than one
+    // action beside the tools (e.g. Open + Reset-zoom on the waveform
+    // view).
+    ActionHandle addAction(Icons::Id icon, OnActionClick onClick);
+
+    // Remove all action buttons. Tools are preserved.
     void clearAction();
 
 private:
@@ -86,9 +103,12 @@ private:
     ToolHandle activeTool;
     int activeToolIndex = -1;
 
-    std::unique_ptr<ToolButton> actionButton;
-    OnActionClick onActionClick;
-    bool hasAction = false;
+    struct ActionEntry {
+        std::unique_ptr<ToolButton> button;
+        OnActionClick onClick;
+        int index = -1;
+    };
+    std::vector<ActionEntry> actions;
 
     void layoutButtons();
 };

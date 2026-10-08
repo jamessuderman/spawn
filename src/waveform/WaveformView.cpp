@@ -46,6 +46,12 @@ constexpr int kPlayheadRepaintMs = 16;
 // wheel fling or mouse jog from jumping past min/max zoom in a single tick.
 constexpr double kMaxZoomStep = 4.0;
 
+// Click-vs-drag disambiguation distance, in pixels. A press that releases
+// within this radius of its origin is treated as a click (and starts
+// preview playback on the background). Anything past this commits the
+// gesture to a drag (pan, marker drag, zoom) and suppresses the click.
+constexpr int kPlayClickSlackPx = 4;
+
 bool hasAudioExtension(const juce::File& file)
 {
     const auto ext = file.getFileExtension().toLowerCase();
@@ -87,6 +93,12 @@ WaveformView::WaveformView(Palette& paletteRef, Mode modeToUse)
     palette.addChangeListener(this);
     setOpaque(true);
 
+    // Mouse activity drives the Scissors mode cursor paint; without
+    // this the painted line lags behind the actual pointer on rapid
+    // motion (repaint() inside mouseMove is throttled by JUCE if
+    // mouse-activity repaints aren't opted into).
+    setRepaintsOnMouseActivity(true);
+
     // Custom mouse cursors from Lucide icons. juce::MouseCursor only takes a
     // juce::Image, so we render each icon into its own 24×24 ARGB image with
     // the hot-spot at the centre so cursor placement lines up with whatever
@@ -122,6 +134,7 @@ void WaveformView::paint(juce::Graphics& g)
         drawWaveform(g, bounds.toType<int>());
         drawMarkers(g, bounds.toType<int>());
         drawPlayhead(g, bounds.toType<int>());
+        drawScissorsCursor(g, bounds.toType<int>());
     }
     else if (mode == Mode::Main)
     {
@@ -160,11 +173,14 @@ bool WaveformView::loadFile(const juce::File& file)
 
     // Reset the active chop and zoom to the full sample range so a freshly
     // loaded file starts with the entire waveform selected and fully visible.
+    // Cuts from a previously-loaded file are discarded — chop boundaries
+    // don't carry across samples.
     const double length = thumbnail.getTotalLength();
     startSeconds = 0.0;
     endSeconds   = length;
     zoomStart    = 0.0;
     zoomEnd      = length;
+    cuts.clear();
     if (partner != nullptr)
         partner->setChopRegion(startSeconds, endSeconds);
 
@@ -188,24 +204,19 @@ void WaveformView::setActiveTool(Tool tool)
         return;
     activeTool = tool;
 
-    // Cancel any drag in progress — the gesture is no longer valid
-    // for the new tool.
-    if (activeDrag != DragTarget::None)
+    // Switching into Scissors hides the OS cursor so the view paints
+    // its own. Switching out restores the arrow over the markers and
+    // background. The mouseMove handler runs on every cursor entry so
+    // the OS cursor snaps back as soon as the user re-enters.
+    if (tool == Tool::Scissors)
+        setMouseCursor(juce::MouseCursor::NoCursor);
+    else
     {
-        activeDrag = DragTarget::None;
-        dragIntent = DragIntent::Unknown;
-        dragAllowDiagonal = false;
+        scissorsCursorActive = false;
+        scissorsCursorX = -1;
+        setMouseCursor(juce::MouseCursor::NormalCursor);
     }
-
-    // Leaving Speaker stops playback. The host's tool-picked callback
-    // is also responsible for this (it calls cancelInteraction()), but
-    // we do it here too so a programmatic tool change stops cleanly
-    // even when the host forgets.
-    if (tool != Tool::Speaker && previewEngine != nullptr
-        && previewEngine->isPlaying())
-    {
-        previewEngine->stop();
-    }
+    repaint();
 }
 
 void WaveformView::setPreviewEngine(spawn::audio::PreviewEngine* engine)
@@ -253,6 +264,117 @@ void WaveformView::setChopRegion(double startSecondsToUse,
     startSeconds = s;
     endSeconds   = e;
     notifyChopChanged();
+}
+
+std::vector<double> WaveformView::getCuts() const
+{
+    return cuts;
+}
+
+void WaveformView::setCuts(std::vector<double> newCuts)
+{
+    cuts = std::move(newCuts);
+    repaint();
+}
+
+bool WaveformView::addCut(double secondsToAdd)
+{
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+        return false;
+
+    // Cuts live strictly inside the sample (a cut at 0 or at length
+    // would create a zero-length chop).
+    const double t = juce::jlimit(kMinChopGapSeconds,
+                                  length - kMinChopGapSeconds,
+                                  secondsToAdd);
+
+    // Dedup: skip if a cut OR a marker (start/end) sits within
+    // kMinChopGapSeconds of t. The marker check keeps the start/end
+    // markers visually distinct and prevents findChopAt() from
+    // having to collapse degenerate boundaries at runtime.
+    auto tooClose = [&](double existing)
+    {
+        return std::abs(existing - t) < kMinChopGapSeconds;
+    };
+    for (const double existing : cuts)
+        if (tooClose(existing)) return false;
+    if (tooClose(startSeconds)) return false;
+    if (tooClose(endSeconds))   return false;
+
+    // Insert into the sorted list. Linear scan + insert is fine — cuts
+    // are bounded by the sample length / min-chop-gap.
+    const auto pos = std::lower_bound(cuts.begin(), cuts.end(), t);
+    cuts.insert(pos, t);
+    repaint();
+    return true;
+}
+
+void WaveformView::findChopAt(double seconds,
+                              double& outStart,
+                              double& outEnd) const
+{
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+    {
+        outStart = 0.0;
+        outEnd   = 0.0;
+        return;
+    }
+
+    // Clamp the query into the sample; out-of-range clicks map to
+    // the nearest chop, so a click just past the end still plays
+    // the final chop (the user almost certainly meant to grab it).
+    const double t = juce::jlimit(0.0, length, seconds);
+
+    // The full chop list is bounded by 0, startSeconds, every cut,
+    // endSeconds, length. We assemble a sorted array of those
+    // boundaries (each side has its own kMinChopGap so degenerate
+    // chops — e.g. startSeconds == 0 — collapse to empty ranges that
+    // the caller skips via the (chopEnd > chopStart) check).
+    //
+    // sorted_chops is built per-call rather than cached so that
+    // marker drags reflect immediately. Five-element allocation on
+    // the message thread is fine — chops interact with the user
+    // only via pointer clicks, and pointer-up latency is dominated
+    // by the engine re-trigger, not by a few doubles on the stack.
+    std::array<double, 5> bounds{};
+    int n = 0;
+    bounds[n++] = 0.0;
+    if (startSeconds > 0.0)         bounds[n++] = startSeconds;
+    for (const double c : cuts)     bounds[n++] = c;
+    if (endSeconds < length)        bounds[n++] = endSeconds;
+    bounds[n++] = length;
+
+    // Deduplicate — cuts sitting exactly on startSeconds or endSeconds
+    // would otherwise produce a duplicate boundary. We collapse
+    // equality (relative or absolute) here so the lower_bound can't
+    // land between two equal values and pick the wrong chop.
+    for (int i = 1; i < n; /* advances */)
+    {
+        if (std::abs(bounds[i] - bounds[i - 1]) < kMinChopGapSeconds)
+        {
+            for (int j = i; j < n - 1; ++j)
+                bounds[j] = bounds[j + 1];
+            --n;
+        }
+        else
+        {
+            ++i;
+        }
+    }
+
+    // Find the first boundary > t (right edge of the chop containing t).
+    // For t exactly on a boundary, "snap right" so consecutive equal
+    // samples pick the chop that ends there. Falls back to length as
+    // the right edge of the last chop.
+    int idxRight = 0;
+    while (idxRight < n - 1 && bounds[idxRight] <= t)
+        ++idxRight;
+    // idxRight is now the index of the first bound > t (or n-1 if none).
+
+    outEnd   = bounds[idxRight];
+    outStart = (idxRight > 0) ? bounds[idxRight - 1] : bounds[0];
 }
 
 bool WaveformView::setZoomWindow(double zoomStartToUse, double zoomEndToUse)
@@ -360,11 +482,26 @@ void WaveformView::mouseMove(const juce::MouseEvent& e)
     if (thumbnail.getTotalLength() <= 0.0)
         return;
 
-    // Speaker tool: arrow cursor everywhere — there are no draggable
-    // elements to advertise.
-    if (activeTool == Tool::Speaker)
+    const auto bounds = getLocalBounds();
+
+    // Scissors hides the OS cursor and tracks the mouse so we can
+    // paint a custom line at its x. mouseMove fires for every cursor
+    // delta while the pointer is inside the view, so we repaint here
+    // unconditionally — without this, the painted line stays put at
+    // the last repaint and visibly lags behind the actual cursor.
+    if (activeTool == Tool::Scissors)
     {
-        setMouseCursor(juce::MouseCursor::NormalCursor);
+        const bool wasActive = scissorsCursorActive;
+        scissorsCursorActive = true;
+        scissorsCursorX = e.x;
+        // No cursor change — setActiveTool already requested NoCursor.
+        // Repaint every move so the painted line tracks the pointer
+        // 1:1. paintScissorsCursor is a single fillRect per call, so
+        // the cost is negligible against mouseMove's dispatch rate.
+        if (wasActive)
+            repaint();
+        else
+            repaint(); // also repaint on transition so the first paint lands
         return;
     }
 
@@ -373,7 +510,7 @@ void WaveformView::mouseMove(const juce::MouseEvent& e)
     // background so the user knows the only grab target is the markers.
     // (Pan still works on click-and-hold of the background; no cursor
     // change is needed to advertise it.)
-    const auto hit = hitTestMarker(e.x, getLocalBounds());
+    const auto hit = hitTestMarker(e.x, bounds);
     if (hit == DragTarget::None)
         setMouseCursor(juce::MouseCursor::NormalCursor);
     else if (grabCursor != nullptr)
@@ -389,56 +526,49 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
 
     const auto bounds = getLocalBounds();
 
-    // Speaker tool: only left-click plays and right-click stops. No
-    // marker drag, no pan, no zoom, no double-click reset. We honour
-    // the click target anywhere on the waveform (background or marker
-    // area); the Speaker tool is about playback, not selection.
-    if (activeTool == Tool::Speaker)
+    // Right-click anywhere on the waveform stops preview playback.
+    if (e.mods.isRightButtonDown())
     {
-        if (e.mods.isRightButtonDown())
-        {
-            if (previewEngine != nullptr)
-                previewEngine->stop();
-        }
-        else if (e.mods.isLeftButtonDown() && previewEngine != nullptr
-                 && startSeconds < endSeconds)
-        {
-            previewEngine->playFrom(startSeconds, endSeconds);
-            // Start the playhead repaint timer. It will self-stop on
-            // the next tick when isPlaying() returns false.
-            startTimer(kPlayheadRepaintMs);
-        }
+        if (previewEngine != nullptr)
+            previewEngine->stop();
         return;
+    }
+
+    // Scissors: left-click adds a cut at the cursor, regardless of
+    // whether the click will subsequently become a pan drag. The cut
+    // is instantaneous — MPC-style chopping, where the slice is born
+    // at the down-press — so the user gets immediate visual feedback
+    // even on a rapid double-tap.
+    if (activeTool == Tool::Scissors && e.mods.isLeftButtonDown())
+    {
+        addCut(xToSeconds(e.x, bounds));
+        // Fall through to the drag-arming logic below so the user can
+        // still pan / drag markers / scrub immediately after cutting.
     }
 
     const auto hit = hitTestMarker(e.x, bounds);
 
     if (hit != DragTarget::None)
     {
+        // Press on a marker: committed to a marker drag, no playback
+        // gesture. The grab cursor is in effect until release.
         activeDrag = hit;
-    }
-    else
-    {
-        // Background press → pan + (optional) vertical-drag zoom. Anchor at the
-        // visible time under the cursor so that horizontal drag keeps the
-        // press point under the cursor, and vertical drag zooms to that
-        // same point (drag up = in, drag down = out).
-        //
-        // Whether the vertical component actually does anything is
-        // resolved in mouseDrag based on which axis dominates — see
-        // dragIntent. Holding Shift at mouseDown bypasses that gate so
-        // diagonal drags still feel continuous.
-        activeDrag = DragTarget::Pan;
-        panAnchorSeconds = xToSeconds(e.x, bounds);
-        dragStartX = e.x;
-        dragStartY = e.y;
-        dragIntent = DragIntent::Unknown;
-        dragAllowDiagonal = e.mods.isShiftDown();
+        dragCommitted = true;
+        setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+        return;
     }
 
-    // Either kind of drag shows the open-hand "grabbing" cursor while the
-    // button is held — that's the user's signal that a drag is in progress,
-    // independent of whether they're moving a marker or panning.
+    // Press on the background: armed for pan + click-to-play. The
+    // gesture stays uncommitted until the cursor has moved past
+    // kPlayClickSlackPx, which keeps a short click starting playback
+    // and a real pan gesture from accidentally previewing the region.
+    activeDrag = DragTarget::Pan;
+    panAnchorSeconds = xToSeconds(e.x, bounds);
+    dragStartX = e.x;
+    dragStartY = e.y;
+    dragIntent = DragIntent::Unknown;
+    dragAllowDiagonal = e.mods.isShiftDown();
+    dragCommitted = false;
     setMouseCursor(juce::MouseCursor::DraggingHandCursor);
 }
 
@@ -446,11 +576,23 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
 {
     if (mode != Mode::Main)
         return;
-    // Speaker tool never drags anything.
-    if (activeTool == Tool::Speaker)
-        return;
 
     const auto bounds = getLocalBounds();
+
+    // A background press stays a candidate click-to-play until we've
+    // moved past the slack. The first motion past the threshold commits
+    // the gesture to a drag and makes the pan path live. Before that
+    // point this handler is a no-op so a tiny jitter of a click never
+    // preview-pans or zooms the view.
+    if (activeDrag == DragTarget::Pan && !dragCommitted)
+    {
+        const int dx = e.x - dragStartX;
+        const int dy = e.y - dragStartY;
+        if (dx * dx + dy * dy < kPlayClickSlackPx * kPlayClickSlackPx)
+            return;
+        dragCommitted = true;
+    }
+
     switch (activeDrag)
     {
         case DragTarget::Start:
@@ -468,26 +610,59 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
 
 void WaveformView::mouseUp(const juce::MouseEvent& e)
 {
-    if (activeTool == Tool::Speaker)
+    // Background press that never committed to a drag is a click on the
+    // waveform: start preview playback of the active chop region. This
+    // is the only input path that ever calls playFrom().
+    //
+    // Note on `e.mods.isLeftButtonDown()`: per JUCE's MouseEvent docs,
+    // on `mouseUp` `mods` reflects the state of the buttons just BEFORE
+    // the release (so callers can tell which button was let go of). The
+    // condition we care about here — "this is a release of a press that
+    // never became a drag" — is fully described by `activeDrag == Pan &&
+    // !dragCommitted`. We do NOT test isLeftButtonDown() because it has
+    // inverted semantics on mouseUp.
+    if (activeDrag == DragTarget::Pan && !dragCommitted)
     {
-        // Speaker tool never had a drag; mouseUp is a no-op (we don't
-        // stop playback on left-button release — playback continues
-        // until end-of-region, an explicit right-click, or a tool
-        // change).
+        if (previewEngine != nullptr)
+        {
+            // Chop-aware playback: the click x picks which chop plays
+            // (Mimic / MPC). The full chop list includes 0,
+            // startSeconds, every cut, endSeconds, and length, with
+            // degenerate boundaries (startSeconds == 0, endSeconds ==
+            // length) collapsed inside findChopAt(). A click on a
+            // boundary marker snaps into the right-side chop.
+            const auto bounds = getLocalBounds();
+            const double clickSeconds = xToSeconds(e.x, bounds);
+            double chopStart = 0.0;
+            double chopEnd   = 0.0;
+            findChopAt(clickSeconds, chopStart, chopEnd);
+            if (chopEnd > chopStart)
+            {
+                previewEngine->playFrom(chopStart, chopEnd);
+                startTimer(kPlayheadRepaintMs);
+            }
+        }
+        activeDrag = DragTarget::None;
+        dragIntent = DragIntent::Unknown;
+        dragAllowDiagonal = false;
+        dragCommitted = false;
+        // Restore the cursor that matches whatever's under the pointer now.
+        mouseMove(e);
         return;
     }
 
     if (activeDrag != DragTarget::None)
     {
-        const bool wasDrag = (activeDrag == DragTarget::Start
-                           || activeDrag == DragTarget::End);
+        const bool wasMarkerDrag = (activeDrag == DragTarget::Start
+                                 || activeDrag == DragTarget::End);
         activeDrag = DragTarget::None;
         dragIntent = DragIntent::Unknown;
         dragAllowDiagonal = false;
+        dragCommitted = false;
         // Mirror the final chop to the partner so the overview indicator
         // catches up at the end of the gesture. Pan doesn't touch the chop
         // region, so we only push it for marker drags.
-        if (wasDrag && partner != nullptr)
+        if (wasMarkerDrag && partner != nullptr)
             partner->setChopRegion(startSeconds, endSeconds);
     }
 
@@ -502,6 +677,16 @@ void WaveformView::mouseExit(const juce::MouseEvent& /*e*/)
     // mid-hover (no active drag).
     if (activeDrag == DragTarget::None)
         setMouseCursor(juce::MouseCursor::NormalCursor);
+
+    // Scissors: hide the painted cursor when the mouse leaves the
+    // view so it doesn't get stranded on screen if the user wiggles
+    // onto another panel. Repaint clears the prior x.
+    if (scissorsCursorActive)
+    {
+        scissorsCursorActive = false;
+        scissorsCursorX = -1;
+        repaint();
+    }
 }
 
 void WaveformView::mouseDoubleClick(const juce::MouseEvent& e)
@@ -509,10 +694,6 @@ void WaveformView::mouseDoubleClick(const juce::MouseEvent& e)
     if (mode != Mode::Main)
         return;
     if (thumbnail.getTotalLength() <= 0.0)
-        return;
-    // Speaker tool: no double-click reset (the user is supposed to
-    // click to play, not double-click to reset).
-    if (activeTool == Tool::Speaker)
         return;
 
     // A double-click anywhere on a populated Main view resets zoom + pan
@@ -527,9 +708,6 @@ void WaveformView::mouseWheelMove(const juce::MouseEvent& e,
     if (mode != Mode::Main)
         return;
     if (thumbnail.getTotalLength() <= 0.0)
-        return;
-    // Speaker tool: wheel does nothing.
-    if (activeTool == Tool::Speaker)
         return;
 
     // Plain wheel zooms centred on the cursor, no modifier required. Wheel
@@ -657,6 +835,14 @@ void WaveformView::drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds)
 
     drawLine(static_cast<float>(xStart));
     drawLine(static_cast<float>(xEnd));
+
+    // Internal cut boundaries (Scissors tool). Same look as the
+    // start/end markers — vertical bone-white lines — so the user
+    // reads them as "this is where one chop ends and the next begins."
+    // The marker drag in mouseDown uses a wider hit-zone
+    // (hitTestMarker handles start/end; cuts are write-only here).
+    for (const double cut : cuts)
+        drawLine(static_cast<float>(secondsToX(cut, bounds, /*unclamped=*/ true)));
 }
 
 void WaveformView::drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds)
@@ -679,6 +865,25 @@ void WaveformView::drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds)
         return;
 
     g.setColour(palette.playhead());
+    g.fillRect(static_cast<float>(x) - kPlayheadThicknessPx * 0.5f,
+               static_cast<float>(bounds.getY()),
+               kPlayheadThicknessPx,
+               static_cast<float>(bounds.getHeight()));
+}
+
+void WaveformView::drawScissorsCursor(juce::Graphics& g,
+                                      juce::Rectangle<int> bounds) const
+{
+    if (activeTool != Tool::Scissors)
+        return;
+    if (!scissorsCursorActive)
+        return;
+
+    // The cursor x is in component-local coords (mouseMove puts it
+    // there directly). Clamp to the bounds so a mouse parked at the
+    // very edge doesn't try to draw outside the clip region.
+    const int x = juce::jlimit(bounds.getX(), bounds.getRight(), scissorsCursorX);
+    g.setColour(palette.primary());
     g.fillRect(static_cast<float>(x) - kPlayheadThicknessPx * 0.5f,
                static_cast<float>(bounds.getY()),
                kPlayheadThicknessPx,

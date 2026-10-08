@@ -198,7 +198,11 @@ namespace {
                 // clears it and re-populates with the tools that apply
                 // to the current content. The toolbar does not own a
                 // toggle group on its own — the host drives setActiveTool
-                // when a tool is picked.
+                // on the toolbar when a tool is picked, and on the
+                // WaveformView too (so Scissors reaches the view's
+                // click-to-cut path). Speaker is the default behaviour:
+                // pan, zoom, marker drag, and click-to-play are live
+                // regardless of which tool is latched.
                 //
                 // Initial population happens via showWaveform() below.
 
@@ -266,45 +270,50 @@ namespace {
             spawn::ui::ToolHandle waveformActiveTool;
             spawn::ui::ToolHandle sequencerActiveTool;
 
-            // Indices of the Move and Speaker tools in the waveform
-            // toolbar, captured at populateWaveformTools() so we can
-            // map a toolbar handle back to a WaveformView::Tool in
-            // applyActiveToolToView. Scissors (index 2) is wired but
-            // has no behaviour yet; the view falls through to Move
-            // for any non-Speaker index.
-            int moveToolIndex    = 0;
-            int speakerToolIndex = 1;
+            // Indices captured at populateWaveformTools() so we can map
+            // a toolbar handle back to a WaveformView::Tool when it gets
+            // picked. The View itself only routes input differently for
+            // Scissors; Speaker is the default (click-to-play stays live).
+            int speakerToolIndex    = 0;
+            int scissorsToolIndex   = 1;
 
             void populateWaveformTools()
             {
                 toolbar->clearTools();
-                const auto move = toolbar->addTool(
-                    spawn::ui::Icons::Id::Move,
-                    [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
                 const auto speaker = toolbar->addTool(
                     spawn::ui::Icons::Id::Volume2,
                     [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
-                toolbar->addTool(spawn::ui::Icons::Id::Scissors,
+                const auto scissors = toolbar->addTool(
+                    spawn::ui::Icons::Id::Scissors,
                     [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
+                // Right-side actions: Open is the primary slot (rightmost),
+                // then Reset-Zoom, then Crop/Trim. All three are
+                // one-shot; none latches, none clears the tool group's
+                // active state.
                 toolbar->setAction(spawn::ui::Icons::Id::FolderOpen,
                     [this] { openAudioFile(); });
+                toolbar->addAction(spawn::ui::Icons::Id::Scan,
+                    [this] { resetWaveformZoom(); });
+                toolbar->addAction(spawn::ui::Icons::Id::Crop,
+                    [this] { trimOutsideMarkers(); });
 
-                // Cache the indices so onWaveformToolPicked can map a
-                // toolbar handle back to a WaveformView::Tool.
-                moveToolIndex    = move.index();
-                speakerToolIndex = speaker.index();
+                speakerToolIndex  = speaker.index();
+                scissorsToolIndex = scissors.index();
 
                 // Re-latch the previous selection if it's still valid,
-                // otherwise default to Move (the first tool).
-                if (waveformActiveTool.isValid()
-                    && waveformActiveTool.index() <= speaker.index())
+                // otherwise default to Speaker. Push the latched tool
+                // into the view so Scissors can switch its input routing.
+                const bool relatchValid =
+                    waveformActiveTool.isValid()
+                    && waveformActiveTool.index() <= scissors.index();
+                if (relatchValid)
                 {
                     toolbar->setActiveTool(waveformActiveTool);
                 }
                 else
                 {
-                    waveformActiveTool = move;
-                    toolbar->setActiveTool(move);
+                    waveformActiveTool = speaker;
+                    toolbar->setActiveTool(speaker);
                 }
                 applyActiveToolToView();
             }
@@ -335,26 +344,31 @@ namespace {
             void onWaveformToolPicked(spawn::ui::ToolHandle handle)
             {
                 // Latched toggle group: clicking the active tool keeps
-                // it latched (no clear path).
+                // it latched (no clear path). Push the new latched tool
+                // into the view so its input routing matches the
+                // toolbar's affordance (Scissors hides the OS cursor and
+                // adds a cut on click; Speaker leaves the click-to-play
+                // path live).
                 toolbar->setActiveTool(handle);
                 waveformActiveTool = handle;
                 applyActiveToolToView();
             }
 
-            // Map the currently-latched toolbar tool to a WaveformView
-            // Tool and push it into the view. The view then re-routes
-            // its mouse handlers; setActiveTool on the view also stops
-            // any in-progress preview if the new tool is not Speaker.
+            // Map the currently-latched waveform toolbar tool to a
+            // WaveformView::Tool and push it into the view. Called from
+            // populateWaveformTools() (initial / re-latch) and
+            // onWaveformToolPicked(). No-op if the WaveformView has
+            // been torn down (e.g. we're between show*() calls).
             void applyActiveToolToView()
             {
                 if (waveformView == nullptr)
                     return;
                 using WaveTool = spawn::ui::WaveformView::Tool;
-                WaveTool t = WaveTool::Move;
+                WaveTool t = WaveTool::Speaker;
                 if (waveformActiveTool.isValid()
-                    && waveformActiveTool.index() == speakerToolIndex)
+                    && waveformActiveTool.index() == scissorsToolIndex)
                 {
-                    t = WaveTool::Speaker;
+                    t = WaveTool::Scissors;
                 }
                 waveformView->setActiveTool(t);
             }
@@ -387,6 +401,104 @@ namespace {
                         waveformView->loadFile(chosen);
                     fileChooser.reset();
                 });
+            }
+
+            // One-shot action wired to the toolbar's Scan icon button.
+            // Resets the waveform view's zoom window to the full sample
+            // so a deeply-zoomed view springs back to "see everything."
+            // No-op when no file is loaded — the view's resetZoom()
+            // already handles that case (length <= 0 short-circuit).
+            void resetWaveformZoom()
+            {
+                if (waveformView != nullptr)
+                    waveformView->resetZoom();
+            }
+
+            // One-shot action wired to the toolbar's Crop icon button.
+            // Destructively trims the engine's buffer to the current
+            // chop region [startSeconds, endSeconds] and reloads the
+            // waveform view from a temp WAV written out of the new
+            // buffer. The legacy chop region collapses back to
+            // [0, newLength]. Internal cut boundaries that fall inside
+            // the new region shift by -startSeconds; cuts that fall
+            // outside the new region are dropped silently.
+            //
+            // No confirm dialog (per James's call — silent, immediate).
+            // No-op when no file is loaded, when the chop region is
+            // empty, or when the engine's buffer is empty.
+            void trimOutsideMarkers()
+            {
+                if (waveformView == nullptr)
+                    return;
+                if (waveformView->getStartSeconds() >= waveformView->getEndSeconds())
+                    return;
+                if (!engine.isPlaying() && !engine.hasBuffer())
+                    return;
+
+                // 1) Snapshot the cuts BEFORE we ask the view to load
+                //    the trimmed temp file (loadFile clears the cuts).
+                const double trimStart  = waveformView->getStartSeconds();
+                const double trimEnd    = waveformView->getEndSeconds();
+                std::vector<double> oldCuts = waveformView->getCuts();
+
+                // 2) Trim the engine's buffer in-place. The engine
+                //    stops playback and parks the playhead at 0.
+                engine.trimToRegion(trimStart, trimEnd);
+
+                // 3) Materialise the trimmed buffer to a temp WAV so
+                //    the AudioThumbnail can read it. The file lives
+                //    for the duration of the next load/trim and gets
+                //    replaced; a future shutdown hook will sweep.
+                const auto tempFile = juce::File::getSpecialLocation(
+                    juce::File::tempDirectory)
+                    .getChildFile("spawn-trim-cache.wav");
+                if (!engine.writeBufferToWav(tempFile))
+                {
+                    juce::Logger::writeToLog(
+                        "trimOutsideMarkers: failed to write temp WAV at "
+                        + tempFile.getFullPathName());
+                    return;
+                }
+
+                // 4) Compute the shifted cut list (Q3a: shift survivors,
+                //    drop those outside the new region). We need the
+                //    new buffer's length to clamp the upper end — read
+                //    it from the engine via getCurrentPositionSeconds
+                //    (no, that's the playhead). The engine's
+                //    totalSourceSamples is atomic; we just trust the
+                //    loadFile call to refresh the view's notion of
+                //    length next.
+                std::vector<double> shifted;
+                shifted.reserve(oldCuts.size());
+                for (const double c : oldCuts)
+                {
+                    const double rel = c - trimStart;
+                    if (rel <= 0.0) continue;       // outside the new region (left)
+                    shifted.push_back(rel);
+                }
+                // We don't know the new length yet (the engine has it
+                // but doesn't expose it; the view will get it from
+                // loadFile). Drop the upper-bound clamp here and
+                // re-apply after loadFile via the view's own
+                // dedup/clamps when we setCuts().
+
+                // 5) Reload the view from the temp WAV. loadFile
+                //    clears cuts and resets the chop region to
+                //    [0, newLength] — exactly what we want.
+                waveformView->loadFile(tempFile);
+
+                // 6) Re-apply the shifted cut list. setCuts trusts the
+                //    input is sorted + in-range; clamping here is
+                //    conservative (drops anything past the new length).
+                const double newLength = waveformView->getEndSeconds();
+                std::vector<double> clamped;
+                clamped.reserve(shifted.size());
+                for (const double c : shifted)
+                {
+                    if (c >= newLength) continue;  // outside the new region (right)
+                    clamped.push_back(c);
+                }
+                waveformView->setCuts(std::move(clamped));
             }
 
             // Called from the WaveformView's OnFileLoaded hook (which

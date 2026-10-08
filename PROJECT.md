@@ -12,9 +12,115 @@ Spawn is a chops-first sampler workstation with a single C++ codebase that ships
 1. **Standalone app** — for performance, beat-making, and live play.
 2. **VST3 plugin** — to drop into a DAW, exposing the same core.
 
-Inspirations: Reason **Mimic Creative Sampler**, Akai **MPC**, Native Instruments **Battery**, **F9 Audio Bank**, Roland **SP-series**.
+Inspirations: Reason **Mimic Creative Sampler**, Akai **MPC**, Native Instruments **Maschine** (and **Battery**), **F9 Audio Bank**, Roland **SP-series**.
 
 The differentiator: chopping, remapping, and recombining audio is the *primary* verb, not a sub-menu inside a generic sampler.
+
+## Reference products and what we borrow from each
+
+This is the working "we got this from X" ledger. When a feature ships, the file it lands in should cite which reference product shaped it, so future contributors don't re-litigate. Listed roughly in order of how much we've already borrowed.
+
+### Mimic Creative Sampler (Reason) — biggest influence today
+
+- **Waveform display**: filled-from-centre mono on Ink; the two-strip
+  Overview + Main layout (50 px + 200 px, 4 px gap, 4 px corner radius).
+  Channel 0 only — Mimic's manual is explicit that the waveform is always
+  mono regardless of source stereo. We copy this as a defended decision,
+  not an oversight.
+- **Chop markers**: the start/end handle + grab-cursor pattern. Click on
+  a marker to arm a drag; click on the background to play.
+- **Active-region emphasis**: ember fill inside `[start, end]`, muted
+  border-grey outside — Sampler convention. Same pattern for chops once
+  we render per-chop fills.
+- **Project save/load**: JSON-based, single-file `.spawnproj` (with
+  embedded or referenced samples — see `v1 scope`). Mimic's
+  `.patch`/`-chunk` model is the closest analog in product behaviour.
+
+### Akai MPC — chops-first, hardware-feel paddding, beat templating
+
+- **Scissors → instant cut**: we mirror MPC's mode where the click
+  itself births a slice, not "click-then-confirm." The 4 px
+  click-vs-drag slack is the same dance MPC pads do — short tap
+  triggers, drag is a separate gesture.
+- **Pad grid**: 4×4 default, configurable in v1 stretch. MPC's pad
+  lighting on trigger (flash + colour) is our "Pad lighting on
+  trigger" open question; we follow MPC's flash-only path unless
+  pressure / aftertouch lands.
+- **Choke / mute groups**: per-slice, multi-pad slots. Direct copy
+  from MPC kit behaviour.
+- **16-step sequencer** defaults: MPC's swing, micro-timing nudge.
+- **Time-stretch**: per-slice with pitch preserved. MPC's "Pad
+  Stretch" and "Stereo" modes map roughly onto our future stretch
+  quality / preserve-formant axis (see Tech stack — Rubber Band is
+  the engine).
+- **Where we diverge**: we don't carry MPC's project/sample/library
+  file structure into v1 — Mimic's simpler patch model wins for
+  one-file-per-song mental model.
+
+### Native Instruments Maschine
+
+- **Pattern-per-section architecture**: song = scenes of patterns
+  (every pattern can hold its own sequence). Borrowed as our
+  "Sequencer tab is patterns; scenes are a tab or modal later."
+- **Per-pad FX chain** (filter → drive → sends → delay/reverb as
+  inserts): we ship a flat per-pad chain in v1; nested modulation
+  routing is stretch.
+- **Macro controls**: 8 macros, mappable to any parameter, exposed
+  on top of the controller for instant morph. Stretch goal — pair
+  with MIDI CC learn.
+- **Browser → drag-to-pad** as the canonical kit-building gesture.
+  We adopt (stretch goal currently — see `v1 stretch`).
+- **Where we diverge**: Maschine's IK multimedia controller
+  integration is out of scope for v1; we ship a software-only build.
+
+### Native Instruments Battery
+
+- **Cell-based pad layout**, drag samples directly into cells, multi-
+  layer per cell (round-robin / random / velocity-stack). For v1 we
+  ship single-sample-per-pad; multi-layer lands if the data model
+  cooperates in M3.
+- **Per-cell envelope/filter/FX chain**: same shape as Maschine's
+  per-pad, which is why those two collapse to one design in our doc.
+- **Where we diverge**: Battery is a drum kit, not a chops kit.
+  Spawn's primary verb is chopping arbitrary samples; Battery-
+  shaped features only land where they serve chopping.
+
+### F9 Audio Bank / others (preset kitten aesthetic)
+
+- **Brand direction**: monochromatic with one accent is the F9 / 5
+  Alarm / Underground Kit aesthetic. We aligned to A. Ink for that
+  reason.
+- **Sample-pack / preset catalogue** is in v2 ideas, not v1.
+
+### Roland SP-series (303 / 404 / 555)
+
+- **Vinyl sim + resampling** are not v1. Mentioned only so future
+  contributors don't reach for them first when brainstorming
+  "underground processing" features.
+- **Pattern chaining** via tape-style loops does influence our
+  "long sample behaves like a recording" framing in the Sequencer.
+
+### Reference patterns: where to look before designing a new feature
+
+| Pattern / gesture                        | Source                 | Where we'll use it                          |
+| ---------------------------------------- | ---------------------- | ------------------------------------------- |
+| Click-and-drag vertical zoom on waveform | Mimic + Maschine       | `WaveEditorStack` (M2)                      |
+| Click-to-cut instant slice               | MPC                    | `WaveformView` Scissors tool (M1, ✅)        |
+| Chop region handle with grab cursor      | Mimic                  | `WaveformView` marker drag (M1, ✅)         |
+| Pad trigger flash                        | MPC                    | `Pad` (M2)                                  |
+| Choke groups                             | MPC + Battery          | M3 Envelope / per-pad FX                    |
+| 16-step sequencer, swing, micro-timing   | MPC + Maschine         | Sequencer (M6)                              |
+| Macro controls                           | Maschine               | stretch                                     |
+| Browser drag-to-pad                      | Maschine + Battery     | stretch                                     |
+| Pattern-per-section architecture         | Maschine               | Sequencer / scenes (stretch)                |
+| Save = single JSON file                  | Mimic                  | `ProjectStore` (open M2 question)           |
+
+When sources conflict, Mimic wins for sample editing (it's our
+closest cousin in single-strip waveform UX); MPC wins for chops and
+pad-grid behaviour; Maschine wins for the sequencer and macro
+ecosystem. We document the choice when it happens rather than
+codifying it up-front — keeping the door open to change as we
+learn what actually feels right in the app.
 
 ## v1 scope (committed)
 

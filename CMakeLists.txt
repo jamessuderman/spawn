@@ -48,6 +48,8 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/folder-open.svg
             resources/icons/lucide/save.svg
             resources/icons/lucide/pencil.svg
+            resources/icons/lucide/scan.svg
+            resources/icons/lucide/squares-subtract.svg
             resources/licences/LICENCE-PublicSans.md
             resources/licences/LICENCE-Lucide.md)
 
