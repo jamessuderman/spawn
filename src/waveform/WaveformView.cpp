@@ -1,5 +1,6 @@
 #include "WaveformView.h"
 
+#include "../audio/preview/PreviewEngine.h"
 #include "../ui/fonts/Fonts.h"
 #include "../ui/icons/Icons.h"
 #include "../ui/lookandfeel/Palette.h"
@@ -35,6 +36,11 @@ constexpr int kCursorPx = 24;
 // Per-tick zoom factor for both wheel and vertical-drag zoom. A value of
 // 1.2 means each "tick" multiplies/divides the visible window by 1.2×.
 constexpr double kZoomStep = 1.2;
+
+// Timer interval for playhead repaint. ~60 Hz is enough for a single
+// thin line; faster than the audio block rate so the playhead doesn't
+// step visibly between blocks.
+constexpr int kPlayheadRepaintMs = 16;
 
 // Hard cap on the zoom factor for a single input event. Prevents one big
 // wheel fling or mouse jog from jumping past min/max zoom in a single tick.
@@ -115,6 +121,7 @@ void WaveformView::paint(juce::Graphics& g)
     {
         drawWaveform(g, bounds.toType<int>());
         drawMarkers(g, bounds.toType<int>());
+        drawPlayhead(g, bounds.toType<int>());
     }
     else if (mode == Mode::Main)
     {
@@ -138,6 +145,13 @@ bool WaveformView::loadFile(const juce::File& file)
         return false;
     }
 
+    // Loading a new file stops any in-flight preview so a mid-play
+    // file change doesn't leave the engine pointing at the old
+    // buffer.
+    if (previewEngine != nullptr)
+        previewEngine->stop();
+    stopTimer();
+
     thumbnail.setSource(new juce::FileInputSource(file));
     repaint();
 
@@ -154,12 +168,58 @@ bool WaveformView::loadFile(const juce::File& file)
     if (partner != nullptr)
         partner->setChopRegion(startSeconds, endSeconds);
 
+    // Notify the host so it can kick off a sample decode for the audio
+    // engine. The view does not own the engine and never calls into it
+    // directly from here.
+    if (onFileLoaded != nullptr)
+        onFileLoaded(file);
+
     return true;
 }
 
 void WaveformView::setPartnerView(WaveformView* other)
 {
     partner = other;
+}
+
+void WaveformView::setActiveTool(Tool tool)
+{
+    if (activeTool == tool)
+        return;
+    activeTool = tool;
+
+    // Cancel any drag in progress — the gesture is no longer valid
+    // for the new tool.
+    if (activeDrag != DragTarget::None)
+    {
+        activeDrag = DragTarget::None;
+        dragIntent = DragIntent::Unknown;
+        dragAllowDiagonal = false;
+    }
+
+    // Leaving Speaker stops playback. The host's tool-picked callback
+    // is also responsible for this (it calls cancelInteraction()), but
+    // we do it here too so a programmatic tool change stops cleanly
+    // even when the host forgets.
+    if (tool != Tool::Speaker && previewEngine != nullptr
+        && previewEngine->isPlaying())
+    {
+        previewEngine->stop();
+    }
+}
+
+void WaveformView::setPreviewEngine(spawn::audio::PreviewEngine* engine)
+{
+    previewEngine = engine;
+    // Drop any running timer; we'll start it again on the next
+    // isPlaying() true.
+    stopTimer();
+    repaint();
+}
+
+void WaveformView::setOnFileLoaded(OnFileLoaded handler)
+{
+    onFileLoaded = std::move(handler);
 }
 
 void WaveformView::setChopRegion(double startSecondsToUse,
@@ -282,12 +342,31 @@ void WaveformView::changeListenerCallback(juce::ChangeBroadcaster* source)
         repaint();
 }
 
+void WaveformView::timerCallback()
+{
+    if (previewEngine == nullptr || !previewEngine->isPlaying())
+    {
+        stopTimer();
+        repaint();
+        return;
+    }
+    repaint();
+}
+
 void WaveformView::mouseMove(const juce::MouseEvent& e)
 {
     if (mode != Mode::Main)
         return;
     if (thumbnail.getTotalLength() <= 0.0)
         return;
+
+    // Speaker tool: arrow cursor everywhere — there are no draggable
+    // elements to advertise.
+    if (activeTool == Tool::Speaker)
+    {
+        setMouseCursor(juce::MouseCursor::NormalCursor);
+        return;
+    }
 
     // Default cursor: arrow. Only the marker lines get the
     // unfold-horizontal affordance — the rest of the area reads as plain
@@ -309,6 +388,29 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
         return;
 
     const auto bounds = getLocalBounds();
+
+    // Speaker tool: only left-click plays and right-click stops. No
+    // marker drag, no pan, no zoom, no double-click reset. We honour
+    // the click target anywhere on the waveform (background or marker
+    // area); the Speaker tool is about playback, not selection.
+    if (activeTool == Tool::Speaker)
+    {
+        if (e.mods.isRightButtonDown())
+        {
+            if (previewEngine != nullptr)
+                previewEngine->stop();
+        }
+        else if (e.mods.isLeftButtonDown() && previewEngine != nullptr
+                 && startSeconds < endSeconds)
+        {
+            previewEngine->playFrom(startSeconds, endSeconds);
+            // Start the playhead repaint timer. It will self-stop on
+            // the next tick when isPlaying() returns false.
+            startTimer(kPlayheadRepaintMs);
+        }
+        return;
+    }
+
     const auto hit = hitTestMarker(e.x, bounds);
 
     if (hit != DragTarget::None)
@@ -344,6 +446,9 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
 {
     if (mode != Mode::Main)
         return;
+    // Speaker tool never drags anything.
+    if (activeTool == Tool::Speaker)
+        return;
 
     const auto bounds = getLocalBounds();
     switch (activeDrag)
@@ -363,6 +468,15 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
 
 void WaveformView::mouseUp(const juce::MouseEvent& e)
 {
+    if (activeTool == Tool::Speaker)
+    {
+        // Speaker tool never had a drag; mouseUp is a no-op (we don't
+        // stop playback on left-button release — playback continues
+        // until end-of-region, an explicit right-click, or a tool
+        // change).
+        return;
+    }
+
     if (activeDrag != DragTarget::None)
     {
         const bool wasDrag = (activeDrag == DragTarget::Start
@@ -396,6 +510,10 @@ void WaveformView::mouseDoubleClick(const juce::MouseEvent& e)
         return;
     if (thumbnail.getTotalLength() <= 0.0)
         return;
+    // Speaker tool: no double-click reset (the user is supposed to
+    // click to play, not double-click to reset).
+    if (activeTool == Tool::Speaker)
+        return;
 
     // A double-click anywhere on a populated Main view resets zoom + pan
     // back to the full sample. The chop region stays where it was.
@@ -409,6 +527,9 @@ void WaveformView::mouseWheelMove(const juce::MouseEvent& e,
     if (mode != Mode::Main)
         return;
     if (thumbnail.getTotalLength() <= 0.0)
+        return;
+    // Speaker tool: wheel does nothing.
+    if (activeTool == Tool::Speaker)
         return;
 
     // Plain wheel zooms centred on the cursor, no modifier required. Wheel
@@ -536,6 +657,32 @@ void WaveformView::drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds)
 
     drawLine(static_cast<float>(xStart));
     drawLine(static_cast<float>(xEnd));
+}
+
+void WaveformView::drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds)
+{
+    if (previewEngine == nullptr)
+        return;
+    if (!previewEngine->isPlaying())
+        return;
+
+    // Same coordinate system as the chop markers: x is the visible
+    // window's time axis. When the playhead's source position is
+    // outside the visible window (e.g. user panned/zoomed while
+    // playing — not possible in Speaker tool but possible if we
+    // ever add scrubbing) we let secondsToX clamp it to the edge so
+    // the playhead reads as pinned to the boundary, matching the
+    // behaviour of the chop markers when zoomed past their position.
+    const double posSeconds = previewEngine->getCurrentPositionSeconds();
+    const int x = secondsToX(posSeconds, bounds);
+    if (x < bounds.getX() || x > bounds.getRight())
+        return;
+
+    g.setColour(palette.playhead());
+    g.fillRect(static_cast<float>(x) - kPlayheadThicknessPx * 0.5f,
+               static_cast<float>(bounds.getY()),
+               kPlayheadThicknessPx,
+               static_cast<float>(bounds.getHeight()));
 }
 
 void WaveformView::visibleWindow(double& outStart, double& outEnd) const

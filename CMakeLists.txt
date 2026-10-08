@@ -46,15 +46,21 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/scissors.svg
             resources/icons/lucide/move.svg
             resources/icons/lucide/folder-open.svg
+            resources/icons/lucide/save.svg
+            resources/icons/lucide/pencil.svg
             resources/licences/LICENCE-PublicSans.md
             resources/licences/LICENCE-Lucide.md)
 
     target_sources(SpawnStandalone
         PRIVATE
             src/Main.cpp
+            src/audio/preview/AudioDeviceHolder.cpp
+            src/audio/preview/PreviewEngine.cpp
+            src/audio/preview/SampleDecoder.cpp
             src/controlheader/ControlHeader.cpp
             src/controlheader/DisplayButton.cpp
             src/display/Display.cpp
+            src/samplecontrols/SampleControls.cpp
             src/sequencer/SequencerView.cpp
             src/toolbar/Toolbar.cpp
             src/toolbar/ToolButton.cpp
@@ -65,6 +71,7 @@ if(SPAWN_BUILD_STANDALONE)
             src/ui/fonts/Fonts.cpp
             src/ui/icons/Icon.cpp
             src/ui/icons/Icons.cpp
+            src/ui/knob/Knob.cpp
             src/ui/lookandfeel/Palette.cpp
             src/ui/lookandfeel/SpawnLookAndFeel.cpp
             src/waveform/WaveformView.cpp)
@@ -91,4 +98,40 @@ endif()
 # VST3 plugin (skeleton wired but off by default)
 if(SPAWN_BUILD_VST3)
     # Populated in the VST3 milestone. See PROGRESS.md.
+endif()
+
+# Tests — headless console app that runs juce::UnitTest cases. No audio
+# device is opened; tests construct the engine and decoder directly and
+# drive getNextAudioBlock by hand.
+option(SPAWN_BUILD_TESTS "Build Spawn unit tests" ON)
+if(SPAWN_BUILD_TESTS)
+    juce_add_console_app(SpawnTests
+        PRODUCT_NAME "SpawnTests"
+        PRODUCT_VERSION 0.1.0)
+
+    juce_generate_juce_header(SpawnTests)
+
+    target_sources(SpawnTests
+        PRIVATE
+            tests/test_main.cpp
+            tests/preview_engine_tests.cpp
+            tests/sample_decoder_tests.cpp
+            src/audio/preview/PreviewEngine.cpp
+            src/audio/preview/SampleDecoder.cpp)
+
+    target_link_libraries(SpawnTests
+        PRIVATE
+            juce::juce_core
+            juce::juce_events
+            juce::juce_audio_basics
+            juce::juce_audio_formats
+            juce::juce_gui_basics
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_lto_flags
+            juce::juce_recommended_warning_flags)
+
+    enable_testing()
+    add_test(NAME SpawnTests
+        COMMAND SpawnTests
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:SpawnTests>)
 endif()

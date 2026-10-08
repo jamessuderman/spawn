@@ -28,6 +28,11 @@ public:
     static constexpr juce::uint32 kDefaultBodyText   = 0xCCE8E6E1; // Bone @ 80%
     static constexpr juce::uint32 kDefaultLabelText  = 0xFFE8E6E1; // Bone @ 100%
     static constexpr juce::uint32 kDefaultButtonIdle = 0xCCE8E6E1; // Bone @ 80% (icon tint at rest)
+    // Bone @ 50% — used for the playback playhead line on the waveform.
+    // Sits between bodyText (80%) and placeholder (40%) so it reads as
+    // a mid-tone, distinct from the active chop (ember) and the chop
+    // markers (100% bone) it overlays.
+    static constexpr juce::uint32 kDefaultPlayhead   = 0x80E8E6E1;
 
     // Take the values from `store`; on construction, fall back to the
     // defaults above if the store has nothing recorded. The store pointer
@@ -49,6 +54,8 @@ public:
     juce::Colour muted()      const noexcept { return mutedColour; }
     // Bone at high opacity — used for chop marker lines.
     juce::Colour marker()     const noexcept { return markerColour; }
+    // Bone at 50% — used for the playback playhead line on the waveform.
+    juce::Colour playhead()   const noexcept { return playheadColour; }
 
     // Setters. Each notifies listeners and persists through SettingsStore.
     void setPrimary(juce::Colour c);
@@ -66,6 +73,7 @@ private:
     juce::Colour buttonIdleColour = juce::Colour(kDefaultButtonIdle);
     juce::Colour mutedColour      = juce::Colour(kDefaultBorderIdle);
     juce::Colour markerColour     = juce::Colour(kDefaultLabelText);
+    juce::Colour playheadColour   = juce::Colour(kDefaultPlayhead);
 
     void load();
 };

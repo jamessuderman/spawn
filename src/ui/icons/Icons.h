@@ -23,6 +23,8 @@ public:
         Scissors,
         Move,
         FolderOpen,
+        Save,
+        Pencil,
     };
 
     // Parse and cache the icon at the requested pixel size.

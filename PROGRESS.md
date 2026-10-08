@@ -22,8 +22,9 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 ### M1 — Sample loader *(week 2)* 🟡
 
 - [x] Drag-drop import (WAV, AIFF, MP3, FLAC, OGG, OPUS via `AudioFormatManager::registerBasicFormats()`)
-- [ ] Decoded-to-RAM sample buffer (thumbnails only for now; no playback)
-- [ ] Basic waveform display with zoom/pan (overview strip exists; main view shows the full sample)
+- [x] Decoded-to-RAM sample buffer (`SampleDecoder` → `PreviewEngine` shared `AudioBuffer<float>`)
+- [x] Basic waveform display with zoom/pan (overview strip exists; main view shows the full sample)
+- [x] **Speaker tool preview**: left-click plays `startSeconds` → `endSeconds`; right-click stops; 1 px playhead (`palette().playhead()`, 60 Hz repaint); volume knob in `SampleControls` drives the engine gain via an atomic; pan/zoom/marker-drag/double-click-reset all disabled in Speaker tool
 - [ ] Project save/load (JSON)
 
 ### M2 — Slicer + pad grid *(week 3-4)*
@@ -100,6 +101,9 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - **Waveform layout**: `WaveEditorStack` owns an `Overview` strip (50 px, navigation) above the `Main` editor (200 px, working area). 4 px vertical gap, 24 px outer horizontal padding, 24 px top padding, no bottom padding. Both strips have a 4 px corner radius.
 - **Drag-and-drop**: only the main editor accepts drops (`WaveformView::isInterestedInFileDrag` returns false unless `Mode::Main`). The overview mirrors the main editor's audio source via `setPartnerView()`.
 - **Shutdown order** (locked in `HelloWorldApp::shutdown`): detach `LookAndFeel` → destroy window → destroy `LookAndFeel` → `Fonts::shutdown()` / `Icons::shutdown()` before `MainWindow` exits, so cached `Drawable`s / `Typeface::Ptr`s are torn down while JUCE globals are still alive.
+- **Audio shutdown order**: `AudioDeviceHolder::shutdown()` is called BEFORE the main window is destroyed, so the device's audio callback is removed before the `WaveformView`'s raw pointer into the engine goes out of scope. The engine itself is reset after the window.
+- **Preview engine** (`src/audio/preview/`): a single `PreviewEngine` (one voice, stereo, lock-free transport state) drives the Speaker tool. Decoded samples are shared with the `AudioThumbnail` via the same `AudioBuffer<float>`. Async decode runs on a `juce::ThreadPool` worker. Buffer publication uses the C++20 `std::atomic<std::shared_ptr<T>>` specialisation (no `std::atomic_load` deprecation).
+- **Tests**: `SpawnTests` (headless `juce_add_console_app`) runs `juce::UnitTest`-based tests. 12 cases across `PreviewEngine` (10) and `SampleDecoder` (2) cover idle/play/stop/gain/buffer-swap/end-of-region and a silent-WAV round trip. No audio device required.
 - **Time-stretch**: TBD (Rubber Band default).
 - **Transient detection**: aubio (BSD).
 - **License (source)**: TBD (MIT / dual).

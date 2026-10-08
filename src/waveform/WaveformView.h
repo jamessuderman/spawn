@@ -14,17 +14,27 @@
 // indicator. The cursor over each marker on Main is the Lucide
 // "unfold-horizontal" icon so users see the grab affordance.
 //
-// Zoom and pan (Main only):
+// Zoom and pan (Main only, Move tool):
 //   - Mouse wheel zooms in/out centred on the cursor, no modifier required.
 //   - Click-and-hold on the waveform background (not on a marker) and drag
 //     horizontally to pan the visible window.
 //   - Double-click on the background resets zoom + pan to the full sample.
 //   - The viewport is clamped to [0, length] so panning can't go past either
 //     end, and zooming in stops at a 1 ms minimum visible window.
+//
+// Speaker tool: zoom, pan, marker drag, and double-click reset are all
+// disabled. Left-click plays the active region (startSeconds → endSeconds)
+// through the supplied PreviewEngine; right-click stops playback. A 1 px
+// playhead line in palette().playhead() tracks the engine position while
+// playing. The Timer drives 60 Hz repaints while playback is active.
 
 #pragma once
 
 #include <JuceHeader.h>
+
+#include <memory>
+
+namespace spawn::audio { class PreviewEngine; }
 
 namespace spawn::ui {
 
@@ -32,11 +42,16 @@ class Palette;
 
 class WaveformView : public juce::Component,
                       public juce::FileDragAndDropTarget,
-                      public juce::ChangeListener {
+                      public juce::ChangeListener,
+                      public juce::Timer {
 public:
     // The overview always draws the entire sample regardless of any zoom
     // window. The main view honours its zoom window.
     enum class Mode { Main, Overview };
+
+    // The tool the host has latched. Drives the mouse-handler routing.
+    // Main only — Overview always behaves as Move for input.
+    enum class Tool { Move, Speaker, Scissors };
 
     WaveformView(Palette& palette, Mode mode = Mode::Main);
     ~WaveformView() override;
@@ -53,6 +68,23 @@ public:
     // loadFile will be called whenever this view loads a file. Pass nullptr
     // to unlink.
     void setPartnerView(WaveformView* other);
+
+    // Set the latched tool. The view re-routes its mouse handlers; passing
+    // a tool other than Move stops any in-progress drag and, if the tool
+    // is no longer Speaker, also stops preview playback.
+    void setActiveTool(Tool tool);
+
+    // Set the preview engine. The view reads isPlaying() and
+    // getCurrentPositionSeconds() to draw the playhead; the engine is
+    // non-owning. Pass nullptr to detach.
+    void setPreviewEngine(spawn::audio::PreviewEngine* engine);
+
+    // Callback fired from loadFile() after the thumbnail is set. The
+    // host uses this to kick off a sample decode (the view itself
+    // does NOT touch the audio engine). The callback receives the
+    // juce::File that was loaded.
+    using OnFileLoaded = std::function<void(const juce::File&)>;
+    void setOnFileLoaded(OnFileLoaded handler);
 
     // Chop region in seconds. Both views expose these for the project to
     // read; setting them on an Overview view is allowed (mirrors to partner
@@ -88,6 +120,10 @@ public:
     // ChangeListener — fires when the AudioThumbnail finishes (re)generating
     // and when the Palette changes (so the fill colour tracks the theme).
     void changeListenerCallback(juce::ChangeBroadcaster* source) override;
+
+    // Timer — 60 Hz repaint while preview playback is active. Stops itself
+    // when the engine reports !isPlaying().
+    void timerCallback() override;
 
 private:
     juce::AudioFormatManager formatManager;
@@ -147,6 +183,22 @@ private:
     // Marker line thickness, in pixels — matches the 1 px panel border.
     static constexpr float kMarkerThicknessPx = 1.0f;
 
+    // Active tool. Defaults to Move. Set by the host via setActiveTool.
+    Tool activeTool = Tool::Move;
+
+    // Non-owning pointer to the preview engine. Read by the playhead
+    // painter and by Speaker-tool mouse handlers. May be nullptr if the
+    // host hasn't set one up yet.
+    spawn::audio::PreviewEngine* previewEngine = nullptr;
+
+    // File-loaded callback. The view does not own the audio engine,
+    // so it forwards a notification here so the host can decode and
+    // publish to the engine. Optional — nullptr is a no-op.
+    OnFileLoaded onFileLoaded;
+
+    // Playhead line thickness (px). 1 px to match the chop markers.
+    static constexpr float kPlayheadThicknessPx = 1.0f;
+
     // Custom mouse cursor built from the Lucide unfold-horizontal icon —
     // shown over the marker lines so the user sees they can drag start/end.
     std::unique_ptr<juce::MouseCursor> grabCursor;
@@ -158,6 +210,10 @@ private:
 
     // Draws the two vertical chop marker lines (always bone-white).
     void drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds);
+
+    // Draws the playhead if previewEngine != nullptr and isPlaying() is
+    // true. 1 px vertical line in palette().playhead() colour.
+    void drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds);
 
     // Visible-window seconds (Main = zoomStart/zoomEnd; Overview = 0/full).
     void visibleWindow(double& outStart, double& outEnd) const;

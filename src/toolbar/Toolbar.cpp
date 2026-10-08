@@ -1,6 +1,5 @@
 #include "Toolbar.h"
 
-#include "../ui/icons/Icons.h"
 #include "ToolButton.h"
 
 namespace spawn::ui {
@@ -16,70 +15,70 @@ constexpr int   kButtonGapPx = 8;       // gap between adjacent tool buttons
 
 } // namespace
 
-Toolbar::Toolbar(Palette& paletteRef, Tool activeToolToUse)
-    : palette(paletteRef),
-      activeTool(activeToolToUse)
+Toolbar::Toolbar(Palette& paletteRef)
+    : palette(paletteRef)
 {
     setOpaque(true);
-
-    moveButton     = std::make_unique<ToolButton>(Icons::Id::Move,       kToolIconSize, palette);
-    speakerButton  = std::make_unique<ToolButton>(Icons::Id::Volume2,    kToolIconSize, palette);
-    scissorsButton = std::make_unique<ToolButton>(Icons::Id::Scissors,   kToolIconSize, palette);
-    openButton     = std::make_unique<ToolButton>(Icons::Id::FolderOpen, kToolIconSize, palette);
-
-    addAndMakeVisible(moveButton.get());
-    addAndMakeVisible(speakerButton.get());
-    addAndMakeVisible(scissorsButton.get());
-    addAndMakeVisible(openButton.get());
-
-    // Default latched state.
-    moveButton->setActive(activeTool == Tool::Move);
-    speakerButton->setActive(activeTool == Tool::Speaker);
-    scissorsButton->setActive(activeTool == Tool::Scissors);
-    // openButton is never part of the toggle group.
-
-    // Each tool independently fires its own click, but the Toolbar
-    // intercepts the click to keep the toggle group consistent before
-    // notifying the host.
-    moveButton->setOnClick([this] { setActiveTool(Tool::Move); });
-    speakerButton->setOnClick([this] { setActiveTool(Tool::Speaker); });
-    scissorsButton->setOnClick([this] { setActiveTool(Tool::Scissors); });
-
-    // Open button is an action — fires the host callback directly
-    // without changing the active tool.
-    openButton->setOnClick([this] {
-        if (onOpenClick)
-            onOpenClick();
-    });
 }
 
 Toolbar::~Toolbar() = default;
 
-void Toolbar::setOnToolClick(OnToolClick handler)
+void Toolbar::clearTools()
 {
-    onToolClick = std::move(handler);
+    tools.clear();
+    activeTool = ToolHandle();
+    activeToolIndex = -1;
+    clearAction();
+    resized();
+    repaint();
 }
 
-void Toolbar::setOnOpenClick(OnOpenClick handler)
+ToolHandle Toolbar::addTool(Icons::Id icon, OnToolClick onClick)
 {
-    onOpenClick = std::move(handler);
+    ToolEntry entry;
+    entry.button = std::make_unique<ToolButton>(icon, kToolIconSize, palette);
+    entry.onClick = std::move(onClick);
+    entry.index = static_cast<int>(tools.size());
+    addAndMakeVisible(entry.button.get());
+    entry.button->setOnClick([this, idx = entry.index] {
+        if (idx >= 0 && idx < static_cast<int>(tools.size())
+            && tools[idx].onClick)
+            tools[idx].onClick(ToolHandle(idx));
+    });
+    tools.push_back(std::move(entry));
+    resized();
+    return ToolHandle(entry.index);
 }
 
-void Toolbar::setActiveTool(Tool tool)
+void Toolbar::setActiveTool(ToolHandle handle)
 {
-    if (tool == activeTool)
-        return;
+    activeTool = handle;
+    activeToolIndex = handle.isValid() ? handle.index() : -1;
+    for (size_t i = 0; i < tools.size(); ++i)
+        tools[i].button->setActive(static_cast<int>(i) == activeToolIndex);
+    repaint();
+}
 
-    // Clear hover/press state on both before flipping active so a button
-    // losing its active state doesn't stay ember-tinted because the
-    // cursor is still over it.
-    moveButton->setActive(tool == Tool::Move);
-    speakerButton->setActive(tool == Tool::Speaker);
-    scissorsButton->setActive(tool == Tool::Scissors);
+void Toolbar::setAction(Icons::Id icon, OnActionClick onClick)
+{
+    clearAction();
+    actionButton = std::make_unique<ToolButton>(icon, kToolIconSize, palette);
+    addAndMakeVisible(actionButton.get());
+    onActionClick = std::move(onClick);
+    actionButton->setOnClick([this] {
+        if (onActionClick)
+            onActionClick();
+    });
+    hasAction = true;
+    resized();
+}
 
-    activeTool = tool;
-    if (onToolClick)
-        onToolClick(tool);
+void Toolbar::clearAction()
+{
+    actionButton.reset();
+    onActionClick = nullptr;
+    hasAction = false;
+    resized();
 }
 
 void Toolbar::paint(juce::Graphics& g)
@@ -99,36 +98,30 @@ void Toolbar::paint(juce::Graphics& g)
 
 void Toolbar::resized()
 {
-    // Layout: tools left-aligned in display order (move, speaker,
-    // scissors), with the open action on the far right. The open button
-    // is never part of the toggle group — it's an action, not a mode.
-    const auto mvBounds = moveButton->getPreferredBounds();
-    moveButton->setBounds(
-        kEdgeMargin,
-        (getHeight() - mvBounds.getHeight()) / 2,
-        mvBounds.getWidth(),
-        mvBounds.getHeight());
+    layoutButtons();
+}
 
-    const auto spBounds = speakerButton->getPreferredBounds();
-    speakerButton->setBounds(
-        kEdgeMargin + mvBounds.getWidth() + kButtonGapPx,
-        (getHeight() - spBounds.getHeight()) / 2,
-        spBounds.getWidth(),
-        spBounds.getHeight());
+void Toolbar::layoutButtons()
+{
+    // Left-to-right: tools in add-order, then a gap, then the optional
+    // action button pinned to the right edge.
+    int x = kEdgeMargin;
+    const int yCentre = getHeight() / 2;
+    for (auto& t : tools)
+    {
+        const auto b = t.button->getPreferredBounds();
+        t.button->setBounds(x, yCentre - b.getHeight() / 2,
+                            b.getWidth(), b.getHeight());
+        x += b.getWidth() + kButtonGapPx;
+    }
 
-    const auto scBounds = scissorsButton->getPreferredBounds();
-    scissorsButton->setBounds(
-        kEdgeMargin + mvBounds.getWidth() + kButtonGapPx + spBounds.getWidth() + kButtonGapPx,
-        (getHeight() - scBounds.getHeight()) / 2,
-        scBounds.getWidth(),
-        scBounds.getHeight());
-
-    const auto opBounds = openButton->getPreferredBounds();
-    openButton->setBounds(
-        getWidth() - opBounds.getWidth() - kEdgeMargin,
-        (getHeight() - opBounds.getHeight()) / 2,
-        opBounds.getWidth(),
-        opBounds.getHeight());
+    if (hasAction && actionButton != nullptr)
+    {
+        const auto b = actionButton->getPreferredBounds();
+        actionButton->setBounds(getWidth() - b.getWidth() - kEdgeMargin,
+                                yCentre - b.getHeight() / 2,
+                                b.getWidth(), b.getHeight());
+    }
 }
 
 } // namespace spawn::ui
