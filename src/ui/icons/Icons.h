@@ -19,6 +19,10 @@ public:
         X,
         UnfoldHorizontal,
         ChartGantt,
+        Volume2,
+        Scissors,
+        Move,
+        FolderOpen,
     };
 
     // Parse and cache the icon at the requested pixel size.

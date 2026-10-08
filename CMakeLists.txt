@@ -42,6 +42,10 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/x.svg
             resources/icons/lucide/unfold-horizontal.svg
             resources/icons/lucide/chart-gantt.svg
+            resources/icons/lucide/volume-2.svg
+            resources/icons/lucide/scissors.svg
+            resources/icons/lucide/move.svg
+            resources/icons/lucide/folder-open.svg
             resources/licences/LICENCE-PublicSans.md
             resources/licences/LICENCE-Lucide.md)
 
@@ -52,6 +56,8 @@ if(SPAWN_BUILD_STANDALONE)
             src/controlheader/DisplayButton.cpp
             src/display/Display.cpp
             src/sequencer/SequencerView.cpp
+            src/toolbar/Toolbar.cpp
+            src/toolbar/ToolButton.cpp
             src/settings/PropertyRow.cpp
             src/settings/SettingsView.cpp
             src/settings/ThemeColorSwatch.cpp

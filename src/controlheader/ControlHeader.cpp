@@ -25,6 +25,10 @@ ControlHeader::ControlHeader(Palette& paletteRef)
     sequencerButton = std::make_unique<DisplayButton>(Icons::Id::ChartGantt,         kSequencerIconSize, palette);
     settingsButton  = std::make_unique<DisplayButton>(Icons::Id::Settings,           kSettingsIconSize,  palette);
 
+    waveformButton->setLabel("Sample");
+    sequencerButton->setLabel("Sequence");
+    settingsButton->setLabel("Settings");
+
     addAndMakeVisible(waveformButton.get());
     addAndMakeVisible(sequencerButton.get());
     addAndMakeVisible(settingsButton.get());
@@ -77,30 +81,30 @@ void ControlHeader::paint(juce::Graphics& g)
 
 void ControlHeader::resized()
 {
-    // Each display button sizes itself from DisplayButton::getPreferredFace()
-    // so the icon margin (DisplayButton::kIconMarginPx) is the single source
-    // of truth. Waveform + Sequencer are left-aligned in reading order,
-    // Settings is right-aligned.
-    const int wfFace = waveformButton->getPreferredFace();
+    // Each display button sizes itself from DisplayButton::getPreferredBounds()
+    // so the icon margin / label padding constants on DisplayButton are the
+    // single source of truth. Waveform + Sequencer are left-aligned in
+    // reading order, Settings is right-aligned.
+    const auto wfBounds = waveformButton->getPreferredBounds();
     waveformButton->setBounds(
         kEdgeMargin,
-        (getHeight() - wfFace) / 2,
-        wfFace,
-        wfFace);
+        (getHeight() - wfBounds.getHeight()) / 2,
+        wfBounds.getWidth(),
+        wfBounds.getHeight());
 
-    const int seqFace = sequencerButton->getPreferredFace();
+    const auto seqBounds = sequencerButton->getPreferredBounds();
     sequencerButton->setBounds(
-        kEdgeMargin + wfFace + kButtonGapPx,
-        (getHeight() - seqFace) / 2,
-        seqFace,
-        seqFace);
+        kEdgeMargin + wfBounds.getWidth() + kButtonGapPx,
+        (getHeight() - seqBounds.getHeight()) / 2,
+        seqBounds.getWidth(),
+        seqBounds.getHeight());
 
-    const int stFace = settingsButton->getPreferredFace();
+    const auto stBounds = settingsButton->getPreferredBounds();
     settingsButton->setBounds(
-        getWidth() - stFace - kEdgeMargin,
-        (getHeight() - stFace) / 2,
-        stFace,
-        stFace);
+        getWidth() - stBounds.getWidth() - kEdgeMargin,
+        (getHeight() - stBounds.getHeight()) / 2,
+        stBounds.getWidth(),
+        stBounds.getHeight());
 }
 
 } // namespace spawn::ui

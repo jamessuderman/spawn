@@ -10,6 +10,7 @@
 #include "sequencer/SequencerView.h"
 #include "settings/SettingsView.h"
 #include "stores/SettingsStore.h"
+#include "toolbar/Toolbar.h"
 #include "ui/fonts/Fonts.h"
 #include "ui/lookandfeel/Palette.h"
 #include "ui/lookandfeel/SpawnLookAndFeel.h"
@@ -23,181 +24,239 @@ namespace {
     constexpr int kGap = 4;
 } // namespace
 
-class HelloWorldApp : public juce::JUCEApplication {
-public:
-    HelloWorldApp() = default;
-
-    const juce::String getApplicationName() override { return "Spawn"; }
-    const juce::String getApplicationVersion() override { return "0.1.0"; }
-    bool moreThanOneInstanceAllowed() override { return false; }
-
-    void initialise(const juce::String &) override {
-        // Temporary debug logger so we can read messages from tests.
-        juce::Logger::setCurrentLogger(
-            juce::FileLogger::createDefaultAppLogger("Spawn", "spawn.log",
-                                                     "Spawn log"));
-        spawn::ui::Fonts::initialise();
-
-        // SettingsStore loads from disk on construction; Palette reads from
-        // the store, then writes back to it on every setter.
-        settingsStore = std::make_unique<spawn::ui::SettingsStore>();
-        palette = std::make_unique<spawn::ui::Palette>(*settingsStore);
-
-        lookAndFeel = std::make_unique<spawn::ui::SpawnLookAndFeel>(*palette);
-        juce::LookAndFeel::setDefaultLookAndFeel(lookAndFeel.get());
-        mainWindow = std::make_unique<MainWindow>(getApplicationName(), *palette);
-    }
-
-    void shutdown() override {
-        juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
-        mainWindow = nullptr;
-        lookAndFeel = nullptr;
-        // Flush before destroying so the final theme change survives.
-        if (settingsStore != nullptr)
-            settingsStore->flush();
-        palette = nullptr;
-        settingsStore = nullptr;
-        spawn::ui::Fonts::shutdown();
-        juce::Logger::setCurrentLogger(nullptr);
-    }
-
-private:
-    class MainWindow : public juce::DocumentWindow {
+namespace {
+    class HelloWorldApp : public juce::JUCEApplication {
     public:
-        MainWindow(const juce::String &name, spawn::ui::Palette& paletteRef)
-            : DocumentWindow(name, paletteRef.ink(), DocumentWindow::allButtons, true) {
-            setUsingNativeTitleBar(false);
-            setResizable(true, true);
-            setResizeLimits(800, 300, 4096, 4096);
-            setContentOwned(new RootComponent(paletteRef), true);
-            if (auto *content = getContentComponent())
-                content->setSize(kWindowWidth, kWindowHeight);
-            centreWithSize(kWindowWidth, kWindowHeight);
-            setVisible(true);
+        HelloWorldApp() = default;
+
+        const juce::String getApplicationName() override { return "Spawn"; }
+        const juce::String getApplicationVersion() override { return "0.1.0"; }
+        bool moreThanOneInstanceAllowed() override { return false; }
+
+        void initialise(const juce::String &) override {
+            // Temporary debug logger so we can read messages from tests.
+            juce::Logger::setCurrentLogger(
+                juce::FileLogger::createDefaultAppLogger("Spawn", "spawn.log",
+                                                         "Spawn log"));
+            spawn::ui::Fonts::initialise();
+
+            // SettingsStore loads from disk on construction; Palette reads from
+            // the store, then writes back to it on every setter.
+            settingsStore = std::make_unique<spawn::ui::SettingsStore>();
+            palette = std::make_unique<spawn::ui::Palette>(*settingsStore);
+
+            lookAndFeel = std::make_unique<spawn::ui::SpawnLookAndFeel>(*palette);
+            juce::LookAndFeel::setDefaultLookAndFeel(lookAndFeel.get());
+            mainWindow = std::make_unique<MainWindow>(getApplicationName(), *palette);
         }
 
-        void closeButtonPressed() override {
-            juce::MessageManager::callAsync([] { juce::JUCEApplication::quit(); });
+        void shutdown() override {
+            juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
+            mainWindow = nullptr;
+            lookAndFeel = nullptr;
+            // Flush before destroying so the final theme change survives.
+            if (settingsStore != nullptr)
+                settingsStore->flush();
+            palette = nullptr;
+            settingsStore = nullptr;
+            spawn::ui::Fonts::shutdown();
+            juce::Logger::setCurrentLogger(nullptr);
         }
 
     private:
-        // RootComponent hosts the top-level UI: control header strip and a
-        // Display panel that swaps between the waveform editor (default)
-        // and a settings view (when the header's settings button is on).
-        class RootComponent : public juce::Component {
+        class MainWindow : public juce::DocumentWindow {
         public:
-            explicit RootComponent(spawn::ui::Palette& paletteRef)
-                : palette(paletteRef)
-            {
-                setOpaque(true);
-
-                controlHeader = std::make_unique<spawn::ui::ControlHeader>(palette);
-                display = std::make_unique<spawn::ui::Display>(palette);
-
-                // The WaveformView (and its AudioThumbnail) live for the whole
-                // window lifetime, so a loaded file sticks across content swaps.
-                waveformView = std::make_unique<spawn::ui::WaveformView>(
-                    palette,
-                    spawn::ui::WaveformView::Mode::Main);
-
-                addAndMakeVisible(controlHeader.get());
-                addAndMakeVisible(display.get());
-
-                // Default content: waveform editor. Drop a file on the
-                // Display to load it (the WaveformView is the dnd target).
-                showWaveform();
-
-                controlHeader->setOnWaveformSelect([this] {
-                    showWaveform();
-                });
-
-                controlHeader->setOnSequencerSelect([this] {
-                    showSequencer();
-                });
-
-                controlHeader->setOnSettingsToggle([this] {
-                    showSettings();
-                });
-
-                // Sync the header to the current display content (defaults
-                // to Waveform from showWaveform()).
-                controlHeader->setDisplayContent(display->getContent());
+            MainWindow(const juce::String &name, spawn::ui::Palette& paletteRef)
+                : DocumentWindow(name, paletteRef.ink(), DocumentWindow::allButtons, true) {
+                setUsingNativeTitleBar(false);
+                setResizable(true, true);
+                setResizeLimits(800, 300, 4096, 4096);
+                setContentOwned(new RootComponent(paletteRef), true);
+                if (auto *content = getContentComponent())
+                    content->setSize(kWindowWidth, kWindowHeight);
+                centreWithSize(kWindowWidth, kWindowHeight);
+                setVisible(true);
             }
 
-            void paint(juce::Graphics &g) override {
-                g.fillAll(palette.ink());
-            }
-
-            void resized() override {
-                // Layout, top to bottom:
-                //   ┌──────────────────────────────────────────────┐
-                //   │ kOuterPaddingTop = 16 px                    │
-                //   │ ControlHeader  (kOuterPaddingX inset)        │
-                //   │ Display        (full width, Display::kHeight)│
-                //   │ (no bottom margin)                           │
-                //   └──────────────────────────────────────────────┘
-                auto headerBounds = getLocalBounds()
-                        .withZeroOrigin()
-                        .reduced(kOuterPaddingX, 0);
-
-                headerBounds.setY(kOuterPaddingTop);
-                headerBounds.setHeight(spawn::ui::ControlHeader::kHeight);
-                controlHeader->setBounds(headerBounds);
-
-                auto displayBounds = getLocalBounds().withZeroOrigin().reduced(kOuterPaddingX);
-                displayBounds.setY(kOuterPaddingTop
-                                   + spawn::ui::ControlHeader::kHeight + kGap);
-                displayBounds.setHeight(spawn::ui::Display::kHeight);
-                display->setBounds(displayBounds);
+            void closeButtonPressed() override {
+                juce::MessageManager::callAsync([] { juce::JUCEApplication::quit(); });
             }
 
         private:
-            void showWaveform()
+            // RootComponent hosts the top-level UI: control header strip and a
+            // Display panel that swaps between the waveform editor (default)
+            // and a settings view (when the header's settings button is on).
+            class RootComponent : public juce::Component {
+            public:
+                explicit RootComponent(spawn::ui::Palette& paletteRef)
+                    : palette(paletteRef)
+                {
+                    setOpaque(true);
+
+                    controlHeader = std::make_unique<spawn::ui::ControlHeader>(palette);
+                    toolbar = std::make_unique<spawn::ui::Toolbar>(palette);
+                    display = std::make_unique<spawn::ui::Display>(palette);
+
+                    // The WaveformView (and its AudioThumbnail) live for the whole
+                    // window lifetime, so a loaded file sticks across content swaps.
+                    waveformView = std::make_unique<spawn::ui::WaveformView>(
+                        palette,
+                        spawn::ui::WaveformView::Mode::Main);
+
+                    addAndMakeVisible(controlHeader.get());
+                    addAndMakeVisible(toolbar.get());
+                    addAndMakeVisible(display.get());
+
+                    // Default content: waveform editor. Drop a file on the
+                    // Display to load it (the WaveformView is the dnd target).
+                    showWaveform();
+
+                    controlHeader->setOnWaveformSelect([this] {
+                        showWaveform();
+                    });
+
+                    controlHeader->setOnSequencerSelect([this] {
+                        showSequencer();
+                    });
+
+                    controlHeader->setOnSettingsToggle([this] {
+                        showSettings();
+                    });
+
+                // The toolbar is currently a passive display — its tool
+                // selection doesn't yet drive any display behaviour, but
+                // the host is wired so future tool logic can plug straight
+                // in.
+                toolbar->setOnToolClick([this](spawn::ui::Tool tool) {
+                    onToolPicked(tool);
+                });
+
+                // Open action — pop a file picker and load the chosen
+                // audio file into the WaveformView. Filetypes mirror
+                // those accepted by WaveformView's drag-and-drop.
+                toolbar->setOnOpenClick([this] { openAudioFile(); });
+
+                    // Sync the header to the current display content (defaults
+                    // to Waveform from showWaveform()).
+                    controlHeader->setDisplayContent(display->getContent());
+                }
+
+                void paint(juce::Graphics &g) override {
+                    g.fillAll(palette.ink());
+                }
+
+                void resized() override {
+                    // Layout, top to bottom:
+                    //   ┌──────────────────────────────────────────────┐
+                    //   │ kOuterPaddingTop = 16 px                    │
+                    //   │ ControlHeader  (kOuterPaddingX inset)        │
+                    //   │ Toolbar        (kOuterPaddingX inset, kGap)  │
+                    //   │ Display        (full width, Display::kHeight)│
+                    //   │ (no bottom margin)                           │
+                    //   └──────────────────────────────────────────────┘
+                    auto topStackBounds = getLocalBounds()
+                            .withZeroOrigin()
+                            .reduced(kOuterPaddingX, 0);
+
+                    auto headerBounds = topStackBounds;
+                    headerBounds.setY(kOuterPaddingTop);
+                    headerBounds.setHeight(spawn::ui::ControlHeader::kHeight);
+                    controlHeader->setBounds(headerBounds);
+
+                    auto toolbarBounds = topStackBounds;
+                    toolbarBounds.setY(kOuterPaddingTop
+                                       + spawn::ui::ControlHeader::kHeight + kGap);
+                    toolbarBounds.setHeight(spawn::ui::Toolbar::kHeight);
+                    toolbar->setBounds(toolbarBounds);
+
+                    auto displayBounds = getLocalBounds().withZeroOrigin().reduced(kOuterPaddingX);
+                    displayBounds.setY(kOuterPaddingTop
+                                       + spawn::ui::ControlHeader::kHeight
+                                       + kGap
+                                       + spawn::ui::Toolbar::kHeight
+                                       + kGap);
+                    displayBounds.setHeight(spawn::ui::Display::kHeight);
+                    display->setBounds(displayBounds);
+                }
+
+            private:
+            void onToolPicked(spawn::ui::Tool /*tool*/)
             {
-                // WaveformView is owned by RootComponent so its loaded audio
-                // and AudioThumbnail survive a Settings detour. Display reparents
-                // it but does not own it.
-                display->setChild(waveformView.get());
-                controlHeader->setDisplayContent(spawn::ui::Display::Content::Waveform);
+                // No-op for now — the toolbar is a passive latched
+                // selector. Future per-tool behaviour (speaker preview,
+                // scissors slice tool, etc.) lands here.
             }
 
-            void showSequencer()
+            void openAudioFile()
             {
-                // Like Settings, the SequencerView is constructed on demand
-                // and owned by Display. WaveformView stays alive (parented
-                // or not) so its loaded AudioThumbnail survives the detour.
-                display->setChild(nullptr);
-                display->setContent(
-                    std::make_unique<spawn::ui::SequencerView>(palette),
-                    spawn::ui::Display::Content::Sequencer);
-                controlHeader->setDisplayContent(spawn::ui::Display::Content::Sequencer);
+                // File picker is modal but launched async so the message
+                // loop keeps spinning while it's up. The completion
+                // callback runs on the message thread, where loadFile
+                // can safely poke the WaveformView / AudioThumbnail.
+                fileChooser = std::make_unique<juce::FileChooser>(
+                    "Select an audio file",
+                    juce::File{},
+                    "*.wav,*.aif,*.aiff,*.mp3,*.flac,*.ogg,*.oga,*.opus");
+
+                const auto flags = juce::FileBrowserComponent::openMode
+                                  | juce::FileBrowserComponent::canSelectFiles;
+                fileChooser->launchAsync(flags, [this](const juce::FileChooser& fc) {
+                    auto chosen = fc.getResult();
+                    if (chosen.existsAsFile())
+                        waveformView->loadFile(chosen);
+                    fileChooser.reset();
+                });
             }
 
-            void showSettings()
-            {
-                // Unparent the waveform so it stops painting but stays alive
-                // — its loaded AudioThumbnail sticks around for the next
-                // showWaveform() call.
-                display->setChild(nullptr);
-                display->setContent(
-                    std::make_unique<spawn::ui::SettingsView>(palette),
-                    spawn::ui::Display::Content::Settings);
-                controlHeader->setDisplayContent(spawn::ui::Display::Content::Settings);
-            }
+                void showWaveform()
+                {
+                    // WaveformView is owned by RootComponent so its loaded audio
+                    // and AudioThumbnail survive a Settings detour. Display reparents
+                    // it but does not own it.
+                    display->setChild(waveformView.get());
+                    controlHeader->setDisplayContent(spawn::ui::Display::Content::Waveform);
+                }
+
+                void showSequencer()
+                {
+                    // Like Settings, the SequencerView is constructed on demand
+                    // and owned by Display. WaveformView stays alive (parented
+                    // or not) so its loaded AudioThumbnail survives the detour.
+                    display->setChild(nullptr);
+                    display->setContent(
+                        std::make_unique<spawn::ui::SequencerView>(palette),
+                        spawn::ui::Display::Content::Sequencer);
+                    controlHeader->setDisplayContent(spawn::ui::Display::Content::Sequencer);
+                }
+
+                void showSettings()
+                {
+                    // Unparent the waveform so it stops painting but stays alive
+                    // — its loaded AudioThumbnail sticks around for the next
+                    // showWaveform() call.
+                    display->setChild(nullptr);
+                    display->setContent(
+                        std::make_unique<spawn::ui::SettingsView>(palette),
+                        spawn::ui::Display::Content::Settings);
+                    controlHeader->setDisplayContent(spawn::ui::Display::Content::Settings);
+                }
 
             spawn::ui::Palette& palette;
             std::unique_ptr<spawn::ui::ControlHeader> controlHeader;
+            std::unique_ptr<spawn::ui::Toolbar>       toolbar;
             std::unique_ptr<spawn::ui::Display>       display;
             std::unique_ptr<spawn::ui::WaveformView>  waveformView;
+            std::unique_ptr<juce::FileChooser>        fileChooser;
         };
 
-        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainWindow)
-    };
+            JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainWindow)
+        };
 
-    std::unique_ptr<MainWindow> mainWindow;
-    std::unique_ptr<spawn::ui::SpawnLookAndFeel> lookAndFeel;
-    std::unique_ptr<spawn::ui::Palette> palette;
-    std::unique_ptr<spawn::ui::SettingsStore> settingsStore;
-};
+        std::unique_ptr<MainWindow> mainWindow;
+        std::unique_ptr<spawn::ui::SpawnLookAndFeel> lookAndFeel;
+        std::unique_ptr<spawn::ui::Palette> palette;
+        std::unique_ptr<spawn::ui::SettingsStore> settingsStore;
+    };
+}
 
 START_JUCE_APPLICATION(HelloWorldApp)
