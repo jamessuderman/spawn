@@ -34,6 +34,8 @@ ControlHeader::ControlHeader(Palette& paletteRef)
     addAndMakeVisible(settingsButton.get());
 }
 
+ControlHeader::~ControlHeader() = default;
+
 void ControlHeader::setOnSettingsToggle(OnClick handler)
 {
     settingsButton->setOnClick(std::move(handler));

@@ -46,7 +46,18 @@ Mavis keeps these in sync with reality as decisions land.
 - **Build artifacts**: not committed
 - **Code style**: clang-format (see `tools/.clang-format`)
 - **Tests**: Catch2; every DSP module has unit tests
+
+### Build: Windows (MSVC)
+
 - **Build command**: `.\build.cmd debug` (or `release`) — this sources vcvarsall.bat so the RC step finds Windows.h. The CLion-bundled `cmake --preset=debug` fails at the RC step (UCRT/Windows.h not on the include path); the manual `build.cmd` script in repo root is the working build path. After adding a new icon to `SpawnAssets` SOURCES, also delete `build\debug-x64\SpawnAssets.dir\Debug\*.obj` (or just `Remove-Item -Recurse build\debug-x64\SpawnAssets.dir`) before re-running — stale BinaryData .obj files cause LNK1236 "corrupt or invalid COFF sections" link errors.
+
+### Build: macOS (Apple Clang)
+
+- **Toolchain**: Xcode Command Line Tools (Apple Clang + macOS SDK) + `ninja`. No Xcode.app or Homebrew Clang required.
+- **Build command**: `./build.sh debug` (or `release`) — mirrors `build.cmd`. CMake presets are `debug` / `release` (no `-x64` suffix on Mac).
+- **cmake gotcha**: `/usr/local/bin/cmake` is often an x86_64 Homebrew build and fails with `bad CPU type in executable` on Apple Silicon. Fix with `brew install cmake` (Homebrew puts the arm64 build at `/opt/homebrew/bin/cmake`). `build.sh` auto-detects this and warns; override the binary with `CMAKE=/path/to/cmake ./build.sh debug` if needed.
+- **ninja gotcha**: same arch mismatch applies. `build.sh` puts the first arm64 ninja it finds (CLion's bundled one, then `/opt/homebrew/bin/ninja`) on `PATH` ahead of the system one. If you ever invoke `cmake` directly, do the same.
+- Source code is platform-agnostic — no `_WIN32`/MSVC pragmas in `src/` or `tests/`. JUCE handles platform abstraction.
 
 ## What this file is for
 

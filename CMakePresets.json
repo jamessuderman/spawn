@@ -5,22 +5,22 @@
     {
       "name": "default",
       "hidden": true,
-      "architecture": { "value": "x64", "strategy": "external" },
-      "binaryDir": "${sourceDir}/build/${presetName}"
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "generator": "Ninja"
     },
     {
-      "name": "debug-x64",
-      "displayName": "Debug x64",
-      "description": "Debug, x64, MSVC",
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "Debug build",
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }
     },
     {
-      "name": "release-x64",
-      "displayName": "Release x64",
-      "description": "Release, x64, MSVC",
+      "name": "release",
+      "displayName": "Release",
+      "description": "Release build",
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
@@ -30,11 +30,11 @@
   "buildPresets": [
     {
       "name": "debug",
-      "configurePreset": "debug-x64"
+      "configurePreset": "debug"
     },
     {
       "name": "release",
-      "configurePreset": "release-x64"
+      "configurePreset": "release"
     }
   ]
 }

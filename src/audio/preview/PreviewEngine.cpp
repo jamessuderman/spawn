@@ -30,19 +30,31 @@ PreviewEngine::~PreviewEngine()
     // thread is gone by the time we destruct.
 }
 
+std::shared_ptr<const juce::AudioBuffer<float>> PreviewEngine::loadBuffer() const
+{
+    std::lock_guard<std::mutex> lock(bufferMutex);
+    return bufferRef;
+}
+
+void PreviewEngine::storeBuffer(
+    std::shared_ptr<const juce::AudioBuffer<float>> buffer)
+{
+    std::lock_guard<std::mutex> lock(bufferMutex);
+    bufferRef = std::move(buffer);
+}
+
 void PreviewEngine::setBuffer(
     std::shared_ptr<const juce::AudioBuffer<float>> buffer,
     double sourceSampleRateToUse)
 {
-    // Publish the new buffer to the audio thread. The C++20
-    // std::atomic<std::shared_ptr<T>> specialisation provides the
-    // publication fence so any subsequent audio-thread read sees the
-    // new pointer and the old buffer stays alive until the last
-    // in-flight render finishes.
-    bufferRef.store(std::move(buffer), std::memory_order_release);
+    // Publish the new buffer to the audio thread. The mutex in
+    // storeBuffer() provides the publication fence so any subsequent
+    // audio-thread loadBuffer() sees the new pointer, and the old
+    // buffer stays alive until the last in-flight render finishes.
+    storeBuffer(std::move(buffer));
     sourceSampleRate.store(sourceSampleRateToUse, std::memory_order_release);
 
-    const auto bufferSnapshot = bufferRef.load(std::memory_order_acquire);
+    const auto bufferSnapshot = loadBuffer();
     const int64_t total = (bufferSnapshot != nullptr)
         ? static_cast<int64_t>(bufferSnapshot->getNumSamples())
         : 0;
@@ -53,8 +65,8 @@ void PreviewEngine::setBuffer(
     // previous file doesn't leak into the new one.
     TransportState idle{};
     idle.playing = false;
+    idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
-    positionSamples.store(0, std::memory_order_release);
 }
 
 void PreviewEngine::playFrom(double startSeconds, double endSeconds)
@@ -82,19 +94,19 @@ void PreviewEngine::playFrom(double startSeconds, double endSeconds)
     }
 
     TransportState next{};
-    next.playing    = true;
+    next.playing     = true;
     next.startSample = s;
     next.endSample   = e;
+    next.posSample   = s;
     transport.store(next, std::memory_order_release);
-    positionSamples.store(s, std::memory_order_release);
 }
 
 void PreviewEngine::stop()
 {
     TransportState idle{};
-    idle.playing = false;
+    idle.playing   = false;
+    idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
-    positionSamples.store(0, std::memory_order_release);
 }
 
 void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
@@ -115,10 +127,10 @@ void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
         return;
     }
 
-    // Snapshot the current buffer; copy from it (no atomic publication
+    // Snapshot the current buffer; copy from it (no publication
     // needed here since we're on the message thread and only one of
     // us is reading).
-    const auto bufferSnapshot = bufferRef.load(std::memory_order_acquire);
+    const auto bufferSnapshot = loadBuffer();
     if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
         return;
 
@@ -138,23 +150,23 @@ void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
                           ch, static_cast<int>(s),
                           newLength);
 
-    // Publish the new buffer using the same atomic-swap pattern as
+    // Publish the new buffer using the same swap pattern as
     // setBuffer(). The old shared_ptr keeps the old buffer alive
     // until the last in-flight audio render finishes on it.
-    bufferRef.store(trimmed, std::memory_order_release);
+    storeBuffer(trimmed);
     totalSourceSamples.store(newLength, std::memory_order_release);
     sourceSampleRate.store(rate, std::memory_order_release);
 
     // Reset transport to idle at the new buffer's start.
     TransportState idle{};
-    idle.playing = false;
+    idle.playing   = false;
+    idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
-    positionSamples.store(0, std::memory_order_release);
 }
 
 bool PreviewEngine::writeBufferToWav(const juce::File& dest) const
 {
-    const auto bufferSnapshot = bufferRef.load(std::memory_order_acquire);
+    const auto bufferSnapshot = loadBuffer();
     if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
         return false;
     const double rate = sourceSampleRate.load(std::memory_order_acquire);
@@ -203,7 +215,7 @@ double PreviewEngine::getCurrentPositionSeconds() const noexcept
     const double rate = sourceSampleRate.load(std::memory_order_acquire);
     if (rate <= 0.0)
         return 0.0;
-    const int64_t s = positionSamples.load(std::memory_order_relaxed);
+    const int64_t s = transport.load(std::memory_order_relaxed).posSample;
     return static_cast<double>(s) / rate;
 }
 
@@ -250,12 +262,11 @@ void PreviewEngine::getNextAudioBlock(
     if (!t.playing)
         return;
 
-    // Snapshot the shared buffer pointer atomically. The C++20
-    // std::atomic<std::shared_ptr<T>> specialisation provides the
-    // acquire fence so the buffer's contents are published to this
-    // thread.
+    // Snapshot the shared buffer pointer. The mutex in loadBuffer()
+    // provides the acquire fence so the buffer's contents are
+    // published to this thread.
     std::shared_ptr<const juce::AudioBuffer<float>> bufferSnapshot =
-        bufferRef.load(std::memory_order_acquire);
+        loadBuffer();
     if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
         return;
 
@@ -270,8 +281,12 @@ void PreviewEngine::getNextAudioBlock(
 
     const int64_t total = static_cast<int64_t>(bufferSnapshot->getNumSamples());
 
-    // Read the current playhead (in source samples).
-    int64_t posSource = positionSamples.load(std::memory_order_relaxed);
+    // Read the current playhead (in source samples). posSample is part
+    // of the same atomic as the play window, so the UI thread's
+    // playFrom() publishes (window + position) in one store and the
+    // audio thread can never observe the new window with a stale
+    // playhead from the previous play.
+    int64_t posSource = t.posSample;
 
     // The number of source samples consumed by this device block.
     const int64_t deviceToSourceScaleNum = static_cast<int64_t>(
@@ -283,7 +298,8 @@ void PreviewEngine::getNextAudioBlock(
     if (posSource >= t.endSample)
     {
         TransportState idle{};
-        idle.playing = false;
+        idle.playing   = false;
+        idle.posSample = t.endSample;
         transport.store(idle, std::memory_order_release);
         return;
     }
@@ -307,13 +323,12 @@ void PreviewEngine::getNextAudioBlock(
         if (srcIdx >= t.endSample || srcIdx >= total)
         {
             // Reached the end of the play window or the buffer.
-            TransportState idle{};
-            idle.playing = false;
-            transport.store(idle, std::memory_order_release);
             // Publish where we stopped so the UI can show the final
             // playhead position.
-            positionSamples.store(juce::jmin(srcIdx, t.endSample),
-                                  std::memory_order_release);
+            TransportState idle{};
+            idle.playing   = false;
+            idle.posSample = juce::jmin(srcIdx, t.endSample);
+            transport.store(idle, std::memory_order_release);
             // Zero the rest of the buffer (already cleared at the top).
             for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
                 info.buffer->clear(ch, writeStart + i, numSamples - i);
@@ -340,11 +355,19 @@ void PreviewEngine::getNextAudioBlock(
         blockSourceSamples,
         t.endSample - posSource);
     posSource += advanced;
-    positionSamples.store(posSource, std::memory_order_relaxed);
+
+    // Publish the advanced position as part of the same atomic so a
+    // mid-block playFrom() from the UI thread can never observe the
+    // old playhead with a new window. Keep the play window intact
+    // (startSample/endSample) and the playing flag; only posSample
+    // moves forward.
+    TransportState next = t;
+    next.posSample = posSource;
+    transport.store(next, std::memory_order_release);
 
     if (posSource >= t.endSample)
     {
-        TransportState idle{};
+        TransportState idle = next;
         idle.playing = false;
         transport.store(idle, std::memory_order_release);
     }

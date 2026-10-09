@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 namespace spawn::audio {
 
@@ -104,23 +105,47 @@ public:
 private:
     // Lock-free transport state. The UI thread writes via playFrom/stop/
     // setBuffer; the audio thread reads via getNextAudioBlock. The atomic
-    // State carries "playing" vs "idle" plus the current play window
-    // (startSample, endSample) expressed in source-buffer samples. The
-    // separate position counter is the running playhead in source samples.
+    // State carries "playing" vs "idle", the current play window
+    // (startSample, endSample) expressed in source-buffer samples, AND
+    // the running playhead (posSample). Folding the position into the
+    // same atomic as the window is what makes the re-trigger race-free:
+    // playFrom() publishes all three in a single store so the audio
+    // thread can never observe the new window paired with a stale
+    // playhead from the previous play.
     struct TransportState {
-        bool playing = false;
+        bool    playing     = false;
         int64_t startSample = 0;
         int64_t endSample   = 0;
+        int64_t posSample   = 0;  // running playhead, source samples
     };
     std::atomic<TransportState> transport{{}};
-    std::atomic<int64_t> positionSamples{0};
 
     // Persistent shared_ptr so the buffer survives across block
-    // boundaries. The audio thread reads it via std::atomic_load on
-    // the shared_ptr to publish a new pointer safely. We use the
-    // C++20 std::atomic<std::shared_ptr<T>> specialisation to avoid
-    // the deprecation of the free-function std::atomic_load.
-    std::atomic<std::shared_ptr<const juce::AudioBuffer<float>>> bufferRef;
+    // boundaries. Guarded by bufferMutex because std::atomic<std::shared_ptr<T>>
+    // is not portable to libc++ (it lacks the C++20 specialisation and the
+    // primary template mandates a trivially-copyable T). The mutex is held
+    // only for the duration of a shared_ptr copy — buffer access after
+    // loadBuffer() returns touches no shared state.
+    //
+    // RT caveat: std::mutex::lock is technically a blocking syscall on
+    // contention, so the audio thread is not strictly wait-free here. In
+    // practice contention is negligible (UI-thread setBuffer vs. audio-
+    // thread getNextAudioBlock, on a 256-sample block at 48 kHz) and the
+    // previous code's std::atomic_load on a shared_ptr was doing the same
+    // thing under the hood. If we ever profile a glitch here, swap to a
+    // hand-rolled atomic<void*> + control-block structure.
+    mutable std::mutex bufferMutex;
+    std::shared_ptr<const juce::AudioBuffer<float>> bufferRef;
+
+    // Acquire-load the current buffer. Returns an empty shared_ptr if
+    // none has been published yet.
+    std::shared_ptr<const juce::AudioBuffer<float>> loadBuffer() const;
+
+    // Release-store a new buffer. The previous buffer (if any) is kept
+    // alive by the previous shared_ptr until its last in-flight audio
+    // render drops it.
+    void storeBuffer(std::shared_ptr<const juce::AudioBuffer<float>> buffer);
+
     std::atomic<int64_t> totalSourceSamples{0};
     std::atomic<double>  sourceSampleRate{0.0};
 

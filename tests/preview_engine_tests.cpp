@@ -74,6 +74,25 @@ std::vector<float> renderLeftChannel(PreviewEngine& engine, int numSamples)
     return std::vector<float>(p, p + numSamples);
 }
 
+// Build a stereo buffer where each chop holds a distinct constant
+// value. Used by the re-trigger test: chops are
+// [0, chop1) = v0, [chop1, chop2) = v1, [chop2, length) = v2, with
+// sample values that are easy to tell apart.
+std::shared_ptr<juce::AudioBuffer<float>> makeRegionedBuffer(
+    int totalSamples, int chop1, int chop2, float v0, float v1, float v2)
+{
+    auto buf = std::make_shared<juce::AudioBuffer<float>>(2, totalSamples);
+    for (int i = 0; i < totalSamples; ++i)
+    {
+        const float v = (i < chop1) ? v0
+                       : (i < chop2) ? v1
+                       :                v2;
+        buf->setSample(0, i, v);
+        buf->setSample(1, i, v);
+    }
+    return buf;
+}
+
 } // namespace
 
 class PreviewEngineTests : public juce::UnitTest {
@@ -143,6 +162,51 @@ public:
             const float tail = renderMaxAbs(engine, 256);
             expectEquals(tail, 0.0f);
             expect(!engine.isPlaying());
+        }
+
+        beginTest("re-trigger starts at the new playFrom's startSample");
+        {
+            // Regression for the chop-aware click race: a re-trigger
+            // from one chop to another must begin at the NEW chop's
+            // start, not at the old chop's end. We seed the buffer so
+            // each chop holds a distinct constant value (0.1, 0.5, 0.9)
+            // and confirm the first rendered sample of the second
+            // playFrom reflects the new start.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            const int total = 48000;
+            const int chop1 = 16000;
+            const int chop2 = 32000;
+            engine.setBuffer(
+                makeRegionedBuffer(total, chop1, chop2, 0.1f, 0.5f, 0.9f),
+                48000.0);
+            engine.setGain(1.0f);
+
+            // First play: chop 0 [0, 0.33 s). Render one block. The
+            // playhead will advance into the buffer but playFrom
+            // resets it on re-trigger.
+            engine.playFrom(0.0, static_cast<double>(chop1) / 48000.0);
+            (void) renderMaxAbs(engine, 256);
+
+            // Re-trigger: jump straight to the middle chop. The first
+            // sample of the next block must come from the middle
+            // chop (value 0.5), not from chop 0 (0.1) or chop 2 (0.9).
+            const double midStart = static_cast<double>(chop1) / 48000.0;
+            const double midEnd   = static_cast<double>(chop2) / 48000.0;
+            engine.playFrom(midStart, midEnd);
+
+            const auto out = renderLeftChannel(engine, 256);
+            // The first device sample in the block maps to the first
+            // source sample of the new play window, so it must equal
+            // the middle chop's value.
+            expectEquals(out.front(), 0.5f);
+
+            // Re-trigger again: jump to the last chop. First sample
+            // must equal 0.9.
+            const double lastStart = static_cast<double>(chop2) / 48000.0;
+            engine.playFrom(lastStart, 1.0);
+            const auto out2 = renderLeftChannel(engine, 256);
+            expectEquals(out2.front(), 0.9f);
         }
 
         beginTest("getCurrentPositionSeconds tracks playback");

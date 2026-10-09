@@ -122,6 +122,14 @@ bool AudioDeviceHolder::initialise()
 
 void AudioDeviceHolder::shutdown()
 {
+    // Idempotent. ~AudioDeviceHolder calls this too, and the host
+    // calls it explicitly during SpawnApp::shutdown(). The second
+    // invocation must be a no-op so a closed device is never queried
+    // again and a possibly-detached engine is never called into.
+    if (shutdownCalled)
+        return;
+    shutdownCalled = true;
+
     if (deviceManager == nullptr)
         return;
 

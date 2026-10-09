@@ -56,6 +56,7 @@ private:
     std::unique_ptr<juce::AudioDeviceManager> deviceManager;
     PreviewEngine* engine = nullptr;
     bool deviceAvailable = false;
+    bool shutdownCalled = false;
 
     class CallbackForwarder;
     std::unique_ptr<CallbackForwarder> callback;

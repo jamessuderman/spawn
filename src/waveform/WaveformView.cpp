@@ -131,6 +131,12 @@ void WaveformView::paint(juce::Graphics& g)
 
     if (thumbnail.getTotalLength() > 0.0)
     {
+        // Selection tint sits between the panel fill and the
+        // waveform so the ember + muted fills read on top of it.
+        // Drawing over the waveform (instead of under) would lighten
+        // the active region noticeably; drawing under keeps the
+        // selection as a subtle background band.
+        drawSelectionHighlight(g, bounds.toType<int>());
         drawWaveform(g, bounds.toType<int>());
         drawMarkers(g, bounds.toType<int>());
         drawPlayhead(g, bounds.toType<int>());
@@ -181,6 +187,13 @@ bool WaveformView::loadFile(const juce::File& file)
     zoomStart    = 0.0;
     zoomEnd      = length;
     cuts.clear();
+    // A freshly-loaded sample is a single clip spanning the whole
+    // buffer; select it so the highlight appears immediately and the
+    // user can see what's about to be edited. The trim path also
+    // funnels through loadFile (writing a temp WAV and reloading),
+    // so the same rule auto-resets selection after a trim.
+    selectedClipStart = 0.0;
+    selectedClipEnd   = length;
     if (partner != nullptr)
         partner->setChopRegion(startSeconds, endSeconds);
 
@@ -306,6 +319,22 @@ bool WaveformView::addCut(double secondsToAdd)
     // are bounded by the sample length / min-chop-gap.
     const auto pos = std::lower_bound(cuts.begin(), cuts.end(), t);
     cuts.insert(pos, t);
+
+    // Scissors rule: the clip to the RIGHT of the new cut is what just
+    // got "born" by the cut, so it becomes the selected clip. The left
+    // clip is implicit (whatever it was before) and doesn't change.
+    // The right clip is [t, next-boundary], where next-boundary is
+    // either the next cut (if any), endSeconds (if endSeconds is
+    // inside the sample), or length.
+    double rightStart = 0.0;
+    double rightEnd   = 0.0;
+    findChopRightOf(t, rightStart, rightEnd);
+    if (rightEnd > rightStart)
+    {
+        selectedClipStart = rightStart;
+        selectedClipEnd   = rightEnd;
+    }
+
     repaint();
     return true;
 }
@@ -334,17 +363,21 @@ void WaveformView::findChopAt(double seconds,
     // the caller skips via the (chopEnd > chopStart) check).
     //
     // sorted_chops is built per-call rather than cached so that
-    // marker drags reflect immediately. Five-element allocation on
-    // the message thread is fine — chops interact with the user
-    // only via pointer clicks, and pointer-up latency is dominated
-    // by the engine re-trigger, not by a few doubles on the stack.
-    std::array<double, 5> bounds{};
-    int n = 0;
-    bounds[n++] = 0.0;
-    if (startSeconds > 0.0)         bounds[n++] = startSeconds;
-    for (const double c : cuts)     bounds[n++] = c;
-    if (endSeconds < length)        bounds[n++] = endSeconds;
-    bounds[n++] = length;
+    // marker drags reflect immediately. Capacity is the upper bound
+    // of entries (4 fixed + cuts.size()); the std::vector is sized
+    // exactly so a sample with many cuts doesn't overrun a fixed
+    // array and corrupt the stack (a 5-element cap silently
+    // truncated past the 5th chop and returned the wrong slice).
+    // Pointer-up latency is dominated by the engine re-trigger, not
+    // by this small heap allocation.
+    std::vector<double> bounds;
+    bounds.reserve(cuts.size() + 4);
+    bounds.push_back(0.0);
+    if (startSeconds > 0.0)         bounds.push_back(startSeconds);
+    for (const double c : cuts)     bounds.push_back(c);
+    if (endSeconds < length)        bounds.push_back(endSeconds);
+    bounds.push_back(length);
+    int n = static_cast<int>(bounds.size());
 
     // Deduplicate — cuts sitting exactly on startSeconds or endSeconds
     // would otherwise produce a duplicate boundary. We collapse
@@ -375,6 +408,115 @@ void WaveformView::findChopAt(double seconds,
 
     outEnd   = bounds[idxRight];
     outStart = (idxRight > 0) ? bounds[idxRight - 1] : bounds[0];
+}
+
+void WaveformView::findChopRightOf(double seconds,
+                                   double& outStart,
+                                   double& outEnd) const
+{
+    // The chop to the right of `seconds` is bounded on the left by
+    // the first chop boundary strictly greater than `seconds`, and on
+    // the right by the next boundary after that. We assemble the same
+    // boundary list findChopAt uses (0, startSeconds if > 0, every
+    // cut, endSeconds if < length, length) and pick the slice that
+    // starts at the first boundary > t. The previous boundary (if
+    // any) becomes its left edge — i.e., we want the [b, b'] where
+    // b' is the first boundary > t, b is the boundary just before
+    // b'. If t is past the last chop boundary, outStart == length
+    // and outEnd == length (empty); the caller treats that as
+    // "no clip to select" and leaves the prior selection in place.
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+    {
+        outStart = 0.0;
+        outEnd   = 0.0;
+        return;
+    }
+
+    std::vector<double> bounds;
+    bounds.reserve(cuts.size() + 4);
+    bounds.push_back(0.0);
+    if (startSeconds > 0.0)         bounds.push_back(startSeconds);
+    for (const double c : cuts)     bounds.push_back(c);
+    if (endSeconds < length)        bounds.push_back(endSeconds);
+    bounds.push_back(length);
+    int n = static_cast<int>(bounds.size());
+
+    // Dedup — same collapsing as findChopAt so a boundary that
+    // overlaps another doesn't create a zero-width chop. Equality
+    // within kMinChopGapSeconds counts as duplicate.
+    for (int i = 1; i < n; /* advances */)
+    {
+        if (std::abs(bounds[i] - bounds[i - 1]) < kMinChopGapSeconds)
+        {
+            for (int j = i; j < n - 1; ++j)
+                bounds[j] = bounds[j + 1];
+            --n;
+        }
+        else
+        {
+            ++i;
+        }
+    }
+
+    // Find the first boundary strictly > t. That boundary becomes
+    // the right edge of the right-of-t chop. The previous boundary
+    // (or 0 if none) becomes its left edge. t past the last
+    // boundary returns an empty range.
+    int idxRight = 0;
+    while (idxRight < n && bounds[idxRight] <= seconds)
+        ++idxRight;
+    if (idxRight >= n)
+    {
+        // t is at or past the right edge of every chop.
+        outStart = length;
+        outEnd   = length;
+        return;
+    }
+    outEnd   = bounds[idxRight];
+    outStart = (idxRight > 0) ? bounds[idxRight - 1] : bounds[0];
+}
+
+void WaveformView::setSelectedClip(double startSecondsToUse,
+                                   double endSecondsToUse)
+{
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+    {
+        // No file loaded: clear selection. The highlight will simply
+        // not draw on the next repaint.
+        if (selectedClipStart == 0.0 && selectedClipEnd == 0.0)
+            return;
+        selectedClipStart = 0.0;
+        selectedClipEnd   = 0.0;
+        repaint();
+        return;
+    }
+
+    double s = juce::jlimit(0.0, length, startSecondsToUse);
+    double e = juce::jlimit(0.0, length, endSecondsToUse);
+    if (s > e) std::swap(s, e);
+
+    // Allow start == end to mean "no selection" (matches the initial
+    // state before any file is loaded). Otherwise a degenerate
+    // selection with e - s < kMinChopGapSeconds would highlight a
+    // hairline band that's invisible anyway.
+    const bool wantEmpty = (e - s) < kMinChopGapSeconds;
+    if (wantEmpty) { s = 0.0; e = 0.0; }
+
+    if (s == selectedClipStart && e == selectedClipEnd)
+        return;
+
+    selectedClipStart = s;
+    selectedClipEnd   = e;
+    repaint();
+}
+
+void WaveformView::getSelectedClip(double& outStart,
+                                   double& outEnd) const noexcept
+{
+    outStart = selectedClipStart;
+    outEnd   = selectedClipEnd;
 }
 
 bool WaveformView::setZoomWindow(double zoomStartToUse, double zoomEndToUse)
@@ -509,8 +651,11 @@ void WaveformView::mouseMove(const juce::MouseEvent& e)
     // unfold-horizontal affordance — the rest of the area reads as plain
     // background so the user knows the only grab target is the markers.
     // (Pan still works on click-and-hold of the background; no cursor
-    // change is needed to advertise it.)
-    const auto hit = hitTestMarker(e.x, bounds);
+    // change is needed to advertise it.) Cuts use the same grab
+    // cursor as Start/End, so the cursor matches the affordance on
+    // every draggable boundary.
+    int cutIdx = -1;
+    const auto hit = hitTestMarker(e.x, bounds, cutIdx);
     if (hit == DragTarget::None)
         setMouseCursor(juce::MouseCursor::NormalCursor);
     else if (grabCursor != nullptr)
@@ -546,13 +691,20 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
         // still pan / drag markers / scrub immediately after cutting.
     }
 
-    const auto hit = hitTestMarker(e.x, bounds);
+    int cutIdx = -1;
+    const auto hit = hitTestMarker(e.x, bounds, cutIdx);
 
     if (hit != DragTarget::None)
     {
         // Press on a marker: committed to a marker drag, no playback
         // gesture. The grab cursor is in effect until release.
+        // DragTarget::Cut carries the cut's index in `cutIdx`; we
+        // copy it into activeCutIndex so the drag handler can
+        // identify the boundary being moved even if the list
+        // re-orders during the drag.
         activeDrag = hit;
+        if (hit == DragTarget::Cut)
+            activeCutIndex = cutIdx;
         dragCommitted = true;
         setMouseCursor(juce::MouseCursor::DraggingHandCursor);
         return;
@@ -597,6 +749,7 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
     {
         case DragTarget::Start:
         case DragTarget::End:
+        case DragTarget::Cut:
             applyMarkerDrag(activeDrag, e.x, bounds);
             break;
         case DragTarget::Pan:
@@ -631,15 +784,37 @@ void WaveformView::mouseUp(const juce::MouseEvent& e)
             // degenerate boundaries (startSeconds == 0, endSeconds ==
             // length) collapsed inside findChopAt(). A click on a
             // boundary marker snaps into the right-side chop.
+            //
+            // Gating: clicks in the muted tails outside the active
+            // region [startSeconds, endSeconds] are no-ops. The
+            // deactivated portions are explicitly "not part of what
+            // the user is editing" — hearing them on click would
+            // contradict the visual. A click right on the start
+            // marker still plays (in-range); a click right on the
+            // end marker does not (out-of-range, the end is the
+            // cut-off). A click that lands within the grab zone of
+            // either marker is already routed to a marker drag by
+            // mouseDown, so this gate only ever sees background
+            // presses.
             const auto bounds = getLocalBounds();
             const double clickSeconds = xToSeconds(e.x, bounds);
-            double chopStart = 0.0;
-            double chopEnd   = 0.0;
-            findChopAt(clickSeconds, chopStart, chopEnd);
-            if (chopEnd > chopStart)
+            if (clickSeconds >= startSeconds && clickSeconds < endSeconds)
             {
-                previewEngine->playFrom(chopStart, chopEnd);
-                startTimer(kPlayheadRepaintMs);
+                double chopStart = 0.0;
+                double chopEnd   = 0.0;
+                findChopAt(clickSeconds, chopStart, chopEnd);
+                if (chopEnd > chopStart)
+                {
+                    // Speaker rule: the clip that just got clicked into
+                    // becomes the selected clip. We use the chop's full
+                    // bounds (chopStart, chopEnd) — not the active region
+                    // — so the highlight covers the whole slice including
+                    // its muted tail.
+                    selectedClipStart = chopStart;
+                    selectedClipEnd   = chopEnd;
+                    previewEngine->playFrom(chopStart, chopEnd);
+                    startTimer(kPlayheadRepaintMs);
+                }
             }
         }
         activeDrag = DragTarget::None;
@@ -654,14 +829,19 @@ void WaveformView::mouseUp(const juce::MouseEvent& e)
     if (activeDrag != DragTarget::None)
     {
         const bool wasMarkerDrag = (activeDrag == DragTarget::Start
-                                 || activeDrag == DragTarget::End);
+                                 || activeDrag == DragTarget::End
+                                 || activeDrag == DragTarget::Cut);
         activeDrag = DragTarget::None;
+        activeCutIndex = -1;
         dragIntent = DragIntent::Unknown;
         dragAllowDiagonal = false;
         dragCommitted = false;
         // Mirror the final chop to the partner so the overview indicator
         // catches up at the end of the gesture. Pan doesn't touch the chop
-        // region, so we only push it for marker drags.
+        // region, so we only push it for marker drags. Cut drags don't
+        // change startSeconds / endSeconds, so the partner sees no
+        // update here — cuts aren't mirrored today (no overview wired
+        // in this milestone).
         if (wasMarkerDrag && partner != nullptr)
             partner->setChopRegion(startSeconds, endSeconds);
     }
@@ -799,6 +979,61 @@ void WaveformView::drawWaveform(juce::Graphics& g, juce::Rectangle<int> bounds)
     drawSlice(endSeconds, visEnd, palette.muted());
 }
 
+void WaveformView::drawSelectionHighlight(juce::Graphics& g, juce::Rectangle<int> bounds) const
+{
+    // Background tint marking the currently-selected clip. Sits
+    // between the panel fill and the waveform so the ember +
+    // muted fills draw on top — the selection reads as a subtle
+    // band of primary-tinted background, not a recolour of the
+    // active chop itself.
+    //
+    // Model vs. view: the stored selection is the chop's full span
+    // (e.g. a Scissors cut's right-of-cut chop is [t, length]). The
+    // visual extent is intersected with the active region
+    // [startSeconds, endSeconds] so the deactivated tails outside
+    // dragged start/end markers stay muted — those tails are
+    // explicitly NOT part of the selected clip's "highlightable"
+    // area, only the slice that would actually play is tinted.
+    //
+    // Empty selection (start == end), empty active region
+    // (endSeconds <= startSeconds), and fully-offscreen selections
+    // short-circuit; the visible-window clip handles the
+    // partially-visible case naturally.
+    if (selectedClipEnd <= selectedClipStart)
+        return;
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+        return;
+    if (endSeconds <= startSeconds)
+        return;
+
+    double visStart, visEnd;
+    visibleWindow(visStart, visEnd);
+    if (visEnd <= visStart)
+        return;
+
+    // Intersect: selection range, then active region, then visible
+    // window. Any empty intersection short-circuits.
+    const double cs = juce::jmax(visStart,
+                                 juce::jmax(selectedClipStart, startSeconds));
+    const double ce = juce::jmin(visEnd,
+                                 juce::jmin(selectedClipEnd,   endSeconds));
+    if (ce <= cs)
+        return;
+
+    const int sx = secondsToX(cs, bounds);
+    const int ex = secondsToX(ce, bounds);
+    if (ex <= sx)
+        return;
+
+    juce::Rectangle<int> r(bounds.getX() + sx,
+                           bounds.getY(),
+                           ex - sx,
+                           bounds.getHeight());
+    g.setColour(palette.primary().withAlpha(0.10f));
+    g.fillRect(r);
+}
+
 void WaveformView::drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds)
 {
     // Two vertical bone-white lines. 1 px to match the panel border. The
@@ -840,7 +1075,7 @@ void WaveformView::drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds)
     // start/end markers — vertical bone-white lines — so the user
     // reads them as "this is where one chop ends and the next begins."
     // The marker drag in mouseDown uses a wider hit-zone
-    // (hitTestMarker handles start/end; cuts are write-only here).
+    // (hitTestMarker handles start, end, and cuts).
     for (const double cut : cuts)
         drawLine(static_cast<float>(secondsToX(cut, bounds, /*unclamped=*/ true)));
 }
@@ -959,8 +1194,10 @@ int WaveformView::secondsToX(double t, juce::Rectangle<int> bounds,
          + static_cast<int>(std::lround(frac * bounds.getWidth()));
 }
 
-WaveformView::DragTarget WaveformView::hitTestMarker(int x, juce::Rectangle<int> bounds) const
+WaveformView::DragTarget WaveformView::hitTestMarker(int x, juce::Rectangle<int> bounds,
+                                                 int& outCutIndex) const
 {
+    outCutIndex = -1;
     if (thumbnail.getTotalLength() <= 0.0)
         return DragTarget::None;
 
@@ -980,6 +1217,32 @@ WaveformView::DragTarget WaveformView::hitTestMarker(int x, juce::Rectangle<int>
     {
         if (distEnd <= kGrabZoneWidthPx)
             return DragTarget::End;
+    }
+
+    // Cut markers — same affordance as Start/End. We pick the
+    // closest cut within the grab zone. Cuts are usually narrower
+    // (or further apart) than the start/end markers, so most of the
+    // time Start/End wins the closest-fight; a click directly on a
+    // cut line still gets a Cut drag. If two cuts ever sit within
+    // `2 * kGrabZoneWidthPx` of each other (would require an
+    // extremely tight chop) the closer one wins, matching the
+    // Start/End behaviour.
+    int bestDist = kGrabZoneWidthPx;
+    int bestIdx  = -1;
+    for (int i = 0; i < static_cast<int>(cuts.size()); ++i)
+    {
+        const int xc = secondsToX(cuts[i], bounds);
+        const int d  = std::abs(x - xc);
+        if (d <= bestDist)
+        {
+            bestDist = d;
+            bestIdx  = i;
+        }
+    }
+    if (bestIdx >= 0)
+    {
+        outCutIndex = bestIdx;
+        return DragTarget::Cut;
     }
     return DragTarget::None;
 }
@@ -1002,7 +1265,19 @@ void WaveformView::applyMarkerDrag(DragTarget target, int x,
                                              t);
         if (newStart != startSeconds)
         {
+            // Selection follows the marker when the marker is the
+            // left edge of the selected clip. Otherwise the user is
+            // dragging a marker that lives inside or to the left of
+            // the selection, and the selection is unaffected. The
+            // `selectedClipStart == startSeconds` check uses the
+            // *old* startSeconds — i.e. the marker position BEFORE
+            // we moved it. If the selected clip's left edge was
+            // sitting on the marker, the edge moves with it.
+            const bool wasSelectionLeftEdge =
+                (selectedClipStart == startSeconds);
             startSeconds = newStart;
+            if (wasSelectionLeftEdge)
+                selectedClipStart = newStart;
             notifyChopChanged();
         }
     }
@@ -1013,9 +1288,81 @@ void WaveformView::applyMarkerDrag(DragTarget target, int x,
                                            t);
         if (newEnd != endSeconds)
         {
+            // Same rule as Start: the selection's right edge follows
+            // the end marker when the marker is the right edge of
+            // the selected clip.
+            const bool wasSelectionRightEdge =
+                (selectedClipEnd == endSeconds);
             endSeconds = newEnd;
+            if (wasSelectionRightEdge)
+                selectedClipEnd = newEnd;
             notifyChopChanged();
         }
+    }
+    else if (target == DragTarget::Cut)
+    {
+        // Move the cut at activeCutIndex to the dragged position,
+        // clamped between its two neighbours in the full boundary
+        // list: prev = 0 / startSeconds / previous cut, next =
+        // length / endSeconds / next cut. The dragged cut must stay
+        // at least kMinChopGapSeconds from each neighbour so a chop
+        // never collapses to a single point or inverts. The list
+        // stays sorted throughout — if the new position would land
+        // in a different slot, we erase + reinsert and update
+        // activeCutIndex so the next drag event tracks the same
+        // physical cut.
+        if (activeCutIndex < 0 || activeCutIndex >= static_cast<int>(cuts.size()))
+            return;
+
+        // Neighbours in the full boundary list. The dragged cut's
+        // index tells us where it sits relative to the other cuts;
+        // we still need to fold startSeconds and endSeconds into
+        // the neighbour search so the cut doesn't drag past them.
+        const double prevBoundary = (activeCutIndex > 0)
+            ? cuts[activeCutIndex - 1]
+            : (startSeconds > 0.0 ? startSeconds : 0.0);
+        const double nextBoundary = (activeCutIndex + 1 < static_cast<int>(cuts.size()))
+            ? cuts[activeCutIndex + 1]
+            : (endSeconds < length ? endSeconds : length);
+
+        const double lo = prevBoundary + kMinChopGapSeconds;
+        const double hi = nextBoundary - kMinChopGapSeconds;
+        // If the gap between neighbours is < 2 * kMinChopGapSeconds
+        // (would only happen with absurdly tight chops), there's no
+        // legal position — leave the cut where it was.
+        if (hi <= lo)
+            return;
+        const double oldCut = cuts[activeCutIndex];
+        const double newT = juce::jlimit(lo, hi, t);
+        if (newT == oldCut)
+            return;
+
+        // Selection follows the cut when the cut coincides with the
+        // selected clip's left or right edge (a cut can be the
+        // outer edge of a chop if it sits at startSeconds/length
+        // — the dedup at addCut prevents this, but a previous
+        // selection might still have an edge that landed on a cut
+        // before the start/end markers were moved). The check uses
+        // the *old* cut value, mirroring the Start/End rule.
+        const bool wasSelectionLeftEdge  = (selectedClipStart == oldCut);
+        const bool wasSelectionRightEdge = (selectedClipEnd   == oldCut);
+
+        // Erase + reinsert to keep the list sorted. The erase shifts
+        // every element after activeCutIndex down by one, so the
+        // reinsertion slot in the shortened list is found with
+        // lower_bound on newT. activeCutIndex is updated to the
+        // cut's new slot so the next drag event tracks the same
+        // physical cut.
+        cuts.erase(cuts.begin() + activeCutIndex);
+        const auto insertionPoint = std::lower_bound(cuts.begin(), cuts.end(), newT);
+        cuts.insert(insertionPoint, newT);
+        activeCutIndex = static_cast<int>(insertionPoint - cuts.begin());
+        if (wasSelectionLeftEdge)
+            selectedClipStart = newT;
+        if (wasSelectionRightEdge)
+            selectedClipEnd = newT;
+        // No notifyChopChanged() — cuts aren't mirrored to the
+        // partner today, and the start/end markers didn't move.
     }
 }
 

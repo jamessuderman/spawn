@@ -137,6 +137,41 @@ public:
     // treated as empty (start == end → caller should skip play).
     void findChopAt(double seconds, double& outStart, double& outEnd) const;
 
+    // Resolve the chop that begins at or after `seconds` (sample time)
+    // into its [outStart, outEnd] bounds. Used after a Scissors cut at
+    // `t` to select the clip to the RIGHT of the cut: the new cut
+    // becomes the left edge of a fresh clip, and we want to highlight
+    // that new clip. Degenerate chops (e.g. startSeconds == 0) collapse
+    // to empty ranges; callers should treat (outEnd <= outStart) as
+    // "no clip to select" and leave the prior selection in place.
+    void findChopRightOf(double seconds, double& outStart, double& outEnd) const;
+
+    // Selected clip — the chop that subsequent edit operations would
+    // target. Selection is purely visual for now (no playback routing
+    // change); the highlight is a 10 % primary fill drawn behind the
+    // waveform so the muted-deactivated look outside the active region
+    // still reads. [startSeconds, endSeconds] is the active-region
+    // pair; the selected-clip range tracks the chop's full span
+    // (e.g. a Scissors cut's right-of-cut chop is [t, length]).
+    //
+    // The visual extent of the highlight is intersected with
+    // [startSeconds, endSeconds] at draw time so the deactivated
+    // tails outside dragged start/end markers are not tinted —
+    // the stored selection is the chop's identity, but only the
+    // portion of the chop that sits inside the active region is
+    // drawn as selected. This keeps the model ("which chop is
+    // selected") and the view ("which pixels are tinted") decoupled
+    // so future M2 edit operations can act on the whole chop
+    // without the highlight misleading the user about what will
+    // change.
+    //
+    // A loaded file selects [0, length]. A Scissors cut selects the
+    // chop to the right of the cut. A Speaker click-to-play selects
+    // the chop that just played. The range collapses to start == end
+    // (no selection) before any file is loaded.
+    void setSelectedClip(double startSecondsToUse, double endSecondsToUse);
+    void getSelectedClip(double& outStart, double& outEnd) const noexcept;
+
     // Zoom window in seconds. Main only — Overview always draws the full
     // sample. Setting on an Overview view is a no-op (returns false).
     bool setZoomWindow(double zoomStartToUse, double zoomEndToUse);
@@ -196,6 +231,14 @@ private:
     // playback slicing per the chops.
     std::vector<double> cuts;
 
+    // Selected clip [start, end], in seconds. start == end means
+    // "no selection" (the view's initial state, before any file is
+    // loaded). After a load, the only chop is [0, length], which is
+    // also the initial selection. A Scissors cut or a Speaker
+    // click-to-play updates this to the chop the user just acted on.
+    double selectedClipStart = 0.0;
+    double selectedClipEnd   = 0.0;
+
     // Zoom window, in seconds. [zoomStart, zoomEnd] is what the Main view
     // currently shows. When zoomStart == 0 and zoomEnd == length, the view
     // shows the full sample (no zoom). Overview ignores these.
@@ -203,8 +246,14 @@ private:
     double zoomEnd   = 0.0;
 
     // Active interaction (Main only). None means we're not dragging.
-    enum class DragTarget { None, Start, End, Pan };
+    // Cut carries the index into `cuts` of the boundary being dragged.
+    enum class DragTarget { None, Start, End, Pan, Cut };
     DragTarget activeDrag = DragTarget::None;
+    // Index into `cuts` for an in-progress Cut drag. Unused when
+    // activeDrag != Cut. Indexes stay valid through the drag — if
+    // the new position would land in a different slot we erase +
+    // reinsert and update the index to track the new slot.
+    int activeCutIndex = -1;
     // True once the press has moved past the click/click-to-play slack and
     // the gesture is committed to being a drag. Until then, mouseUp starts
     // preview playback. Main only.
@@ -278,6 +327,14 @@ private:
     // Draws the two vertical chop marker lines (always bone-white).
     void drawMarkers(juce::Graphics& g, juce::Rectangle<int> bounds);
 
+    // Draws the selected-clip highlight: a flat fill of primary() at
+    // 10 % alpha over the selected clip's x range, full panel height.
+    // Drawn behind the waveform so the ember fill (and the muted
+    // tail of the clip) still read on top. No-op when no clip is
+    // selected (start == end) or when the clip is fully outside the
+    // visible window.
+    void drawSelectionHighlight(juce::Graphics& g, juce::Rectangle<int> bounds) const;
+
     // Draws the playhead if previewEngine != nullptr and isPlaying() is
     // true. 1 px vertical line in palette().playhead() colour.
     void drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds);
@@ -303,10 +360,18 @@ private:
                       bool unclamped = false) const;
 
     // Returns which marker (if any) is under the mouse position. Main only.
-    DragTarget hitTestMarker(int x, juce::Rectangle<int> bounds) const;
+    // When the result is DragTarget::Cut, `outCutIndex` is set to the
+    // index into `cuts` of the cut that was hit; for other results it
+    // is left at -1. The out-param keeps `hitTestMarker` const so
+    // `mouseMove`'s hover path can call it without a `mutable` escape.
+    DragTarget hitTestMarker(int x, juce::Rectangle<int> bounds,
+                             int& outCutIndex) const;
 
     // Update startSeconds / endSeconds from a marker drag, with min-gap
-    // enforcement.
+    // enforcement against the active region's other edge. Cut drags
+    // (DragTarget::Cut) clamp against both neighbours (the previous
+    // and next boundary in the full chop list — 0, startSeconds,
+    // other cuts, endSeconds, length).
     void applyMarkerDrag(DragTarget target, int x, juce::Rectangle<int> bounds);
 
     // Apply a pan + vertical-drag zoom from a mouse drag. Horizontal motion

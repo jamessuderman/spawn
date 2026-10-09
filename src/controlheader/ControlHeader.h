@@ -27,6 +27,7 @@ public:
     using OnClick = std::function<void()>;
 
     ControlHeader(Palette& palette);
+    ~ControlHeader() override;
 
     void paint(juce::Graphics& g) override;
     void resized() override;
