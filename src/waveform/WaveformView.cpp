@@ -339,6 +339,63 @@ bool WaveformView::addCut(double secondsToAdd)
     return true;
 }
 
+bool WaveformView::removeCut(int index)
+{
+    if (index < 0 || index >= static_cast<int>(cuts.size()))
+        return false;
+
+    // Snapshot the value and the selection's relationship to it
+    // before we erase. After the erase, `cuts[index]` is the cut
+    // that used to be at `index + 1` (the next cut), and
+    // `cuts[index - 1]` is unchanged.
+    const double removedCut = cuts[index];
+    const double length = thumbnail.getTotalLength();
+    const bool hasSelection = (selectedClipEnd > selectedClipStart);
+    const bool removedWasStartEdge = hasSelection
+                                  && (removedCut == selectedClipStart);
+    const bool removedWasEndEdge   = hasSelection
+                                  && (removedCut == selectedClipEnd);
+
+    cuts.erase(cuts.begin() + index);
+
+    // Selection update: when the removed cut was the left edge of
+    // the selected clip, the chop to the left of the removed cut
+    // gets pulled into the selection (new left edge = the largest
+    // boundary strictly less than removedCut, picked from {0,
+    // startSeconds, cuts[index - 1]}). Symmetric for the right
+    // edge. If the removed cut is neither edge, the selection
+    // already covers a valid chop and stays put.
+    if (removedWasStartEdge || removedWasEndEdge)
+    {
+        if (removedWasStartEdge)
+        {
+            // Boundary immediately to the left of removedCut.
+            double leftBoundary = 0.0;
+            if (startSeconds > 0.0 && startSeconds < removedCut)
+                leftBoundary = startSeconds;
+            if (index > 0) // cuts[index - 1] is valid; cut before removedCut
+                leftBoundary = std::max(leftBoundary, cuts[index - 1]);
+            selectedClipStart = leftBoundary;
+        }
+        if (removedWasEndEdge)
+        {
+            // Boundary immediately to the right of removedCut.
+            // After the erase, cuts[index] is the cut that used to
+            // be at index + 1 (the next cut), or out of range if
+            // we just removed the last cut.
+            double rightBoundary = length;
+            if (endSeconds < length && endSeconds > removedCut)
+                rightBoundary = endSeconds;
+            if (index < static_cast<int>(cuts.size()))
+                rightBoundary = std::min(rightBoundary, cuts[index]);
+            selectedClipEnd = rightBoundary;
+        }
+    }
+
+    repaint();
+    return true;
+}
+
 void WaveformView::findChopAt(double seconds,
                               double& outStart,
                               double& outEnd) const
@@ -631,19 +688,41 @@ void WaveformView::mouseMove(const juce::MouseEvent& e)
     // delta while the pointer is inside the view, so we repaint here
     // unconditionally — without this, the painted line stays put at
     // the last repaint and visibly lags behind the actual cursor.
+    //
+    // Hovering over an existing cut marker is a separate affordance:
+    // the cut is draggable (DragTarget::Cut) and right-clickable to
+    // remove, so the grab cursor is the right cue there. We swap the
+    // OS cursor to the unfold-horizontal icon and skip painting the
+    // Scissors line so the user sees one affordance, not two. Any
+    // other position (background, or the start/end markers) keeps
+    // the painted line + NoCursor.
     if (activeTool == Tool::Scissors)
     {
-        const bool wasActive = scissorsCursorActive;
-        scissorsCursorActive = true;
-        scissorsCursorX = e.x;
-        // No cursor change — setActiveTool already requested NoCursor.
-        // Repaint every move so the painted line tracks the pointer
-        // 1:1. paintScissorsCursor is a single fillRect per call, so
-        // the cost is negligible against mouseMove's dispatch rate.
-        if (wasActive)
-            repaint();
+        int cutIdx = -1;
+        const auto hit = hitTestMarker(e.x, bounds, cutIdx);
+        const bool overCut = (hit == DragTarget::Cut && grabCursor != nullptr);
+        if (overCut)
+        {
+            // Cut-hover: show the grab cursor, hide the painted line.
+            if (scissorsCursorActive)
+            {
+                scissorsCursorActive = false;
+                scissorsCursorX = -1;
+            }
+            setMouseCursor(*grabCursor);
+        }
         else
-            repaint(); // also repaint on transition so the first paint lands
+        {
+            // Background / start-end hover: painted line, NoCursor.
+            scissorsCursorActive = true;
+            scissorsCursorX = e.x;
+            setMouseCursor(juce::MouseCursor::NoCursor);
+        }
+        // Repaint every move so the painted line tracks the pointer
+        // 1:1 (or clears on transition into a cut hover).
+        // paintScissorsCursor is a single fillRect per call, so the
+        // cost is negligible against mouseMove's dispatch rate.
+        repaint();
         return;
     }
 
@@ -670,6 +749,24 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
         return;
 
     const auto bounds = getLocalBounds();
+
+    // Right-click in Scissors mode over a cut marker removes the
+    // cut. The cut-removal gesture is mode-gated to Scissors so
+    // Speaker mode (the default) keeps its right-click-stops-playback
+    // behaviour on cuts. We hit-test first, then fall through to
+    // the standard stop-playback path when no cut is under the
+    // pointer — that way right-click on the background in Scissors
+    // still stops a playing preview, matching the other tools.
+    if (e.mods.isRightButtonDown() && activeTool == Tool::Scissors)
+    {
+        int cutIdx = -1;
+        const auto hit = hitTestMarker(e.x, bounds, cutIdx);
+        if (hit == DragTarget::Cut)
+        {
+            removeCut(cutIdx);
+            return;
+        }
+    }
 
     // Right-click anywhere on the waveform stops preview playback.
     if (e.mods.isRightButtonDown())

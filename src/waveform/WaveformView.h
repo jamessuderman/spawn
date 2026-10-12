@@ -128,6 +128,26 @@ public:
     // was added, false if the call was dedup'd or the sample is empty.
     bool addCut(double seconds);
 
+    // Remove the cut at `index` in the sorted `cuts` list. The list
+    // stays sorted by simply erasing the entry. Out-of-range indices
+    // are a no-op and return false; a valid removal returns true.
+    //
+    // Selection follows the merge: if the removed cut was the start
+    // edge of the currently-selected clip, the selection's left
+    // edge expands left to the previous boundary in the full
+    // chop list {0, startSeconds, cuts[], endSeconds, length} so
+    // the new selection includes the chop that was on the left of
+    // the removed cut. Symmetrically, if the removed cut was the
+    // end edge, the selection's right edge expands right to include
+    // the next chop. If the removed cut is neither edge the
+    // selection is left alone (it may still correspond to a valid
+    // chop after the merge). No selection (start == end) is a
+    // no-op for the selection update.
+    //
+    // No undo: M1 has no undo infrastructure. Right-click removal is
+    // destructive and immediate.
+    bool removeCut(int index);
+
     // Resolve the chop containing `seconds` (sample time) into its
     // [outStart, outEnd] bounds. A chop is bounded on the left by the
     // previous cut (or 0) and on the right by the next cut (or the

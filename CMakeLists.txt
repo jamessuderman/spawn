@@ -118,8 +118,15 @@ if(SPAWN_BUILD_TESTS)
             tests/test_main.cpp
             tests/preview_engine_tests.cpp
             tests/sample_decoder_tests.cpp
+            tests/waveform_view_tests.cpp
             src/audio/preview/PreviewEngine.cpp
-            src/audio/preview/SampleDecoder.cpp)
+            src/audio/preview/SampleDecoder.cpp
+            src/stores/SettingsStore.cpp
+            src/ui/fonts/Fonts.cpp
+            src/ui/icons/Icon.cpp
+            src/ui/icons/Icons.cpp
+            src/ui/lookandfeel/Palette.cpp
+            src/waveform/WaveformView.cpp)
 
     target_link_libraries(SpawnTests
         PRIVATE
@@ -127,7 +134,9 @@ if(SPAWN_BUILD_TESTS)
             juce::juce_events
             juce::juce_audio_basics
             juce::juce_audio_formats
+            juce::juce_audio_utils
             juce::juce_gui_basics
+            SpawnAssets
             juce::juce_recommended_config_flags
             juce::juce_recommended_lto_flags
             juce::juce_recommended_warning_flags)
