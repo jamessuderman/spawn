@@ -1,8 +1,10 @@
 // Spawn — SettingsView.
-// Renders the Settings panel content inside the Display. Owns one or more
-// PropertyRow children (one per setting). The first row is "Theme Color":
-// clicking its swatch opens a ColourSelector and the picked value is
-// written through Palette → SettingsStore so it survives a restart.
+// Renders the Settings panel content inside the Display. Three columns
+// — Sample, Sequence, Settings — each with an icon-label header and a
+// vertical stack of PropertyRow children. The Settings column carries
+// Theme Color (the only persisted setting today); Sequence carries Root
+// Note (display-only, defaults to C0); Sample is empty in v1 and grows
+// as the sample pipeline exposes more knobs.
 
 #pragma once
 
@@ -15,6 +17,7 @@ namespace spawn::ui {
 
 class Palette;
 class PropertyRow;
+class IconLabel;
 
 class SettingsView : public juce::Component {
 public:
@@ -26,6 +29,7 @@ public:
 
 private:
     Palette& palette;
+    std::vector<std::unique_ptr<IconLabel>> headers;
     std::vector<std::unique_ptr<PropertyRow>> rows;
 };
 

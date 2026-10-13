@@ -1,18 +1,16 @@
-<svg
-  xmlns="http://www.w3.org/2000/svg"
-  width="24"
-  height="24"
-  viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
-  stroke-width="2"
-  stroke-linecap="round"
-  stroke-linejoin="round"
->
-  <path d="M10 22a2 2 0 0 1-2-2" />
-  <path d="M16 22h-2" />
-  <path d="M16 4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3a1 1 0 0 0 1-1v-5a2 2 0 0 1 2-2h5a1 1 0 0 0 1-1z" />
-  <path d="M20 8a2 2 0 0 1 2 2" />
-  <path d="M22 14v2" />
-  <path d="M22 20a2 2 0 0 1-2 2" />
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:affinity="https://www.affinity.studio/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linecap:round;stroke-linejoin:round;">
+    <path d="M10,22C8.903,22 8,21.097 8,20" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <path d="M16,22L14,22" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <path d="M16,4C16,2.903 15.097,2 14,2L4,2C2.903,2 2,2.903 2,4L2,14C2,15.097 2.903,16 4,16L7,16C7.549,16 8,15.549 8,15L8,10C8,8.903 8.903,8 10,8L15,8C15.549,8 16,7.549 16,7L16,4Z" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <path d="M20,8C21.097,8 22,8.903 22,10" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <path d="M22,14L22,16" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <path d="M22,20C22,21.097 21.097,22 20,22" style="fill:none;fill-rule:nonzero;stroke:black;stroke-width:2px;"/>
+    <g transform="matrix(1,0,0,1,0.438005,0.154589)">
+        <path d="M10.957,11.141L17.887,18.617" style="fill:none;stroke:black;stroke-width:1.96px;stroke-miterlimit:1.5;"/>
+    </g>
+    <g transform="matrix(0.049409,0.998779,-0.998779,0.049409,29.008382,-0.105644)">
+        <path d="M10.869,11.049L17.975,18.71" style="fill:none;stroke:black;stroke-width:1.96px;stroke-miterlimit:1.5;"/>
+    </g>
 </svg>

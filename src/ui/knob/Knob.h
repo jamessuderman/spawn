@@ -1,9 +1,10 @@
 // Spawn — Knob.
-// A reusable circular knob. Renders a flat panel-fill disc with an
-// indicator dot on the inside near the rim, and a partial arc on the
-// OUTSIDE of the disc that spans from the "min" angular position
-// (default 7 o'clock, value = 0%) to the current value, in the
-// Palette's primary colour.
+// A reusable circular knob. Renders a stylised dark disc (Knob.svg)
+// with an indicator dot in the highlight gap between the outer dark
+// ring and the next ring inward, and a partial value arc on the
+// OUTSIDE of the SVG (no track) that spans from the "min" angular
+// position (default 7 o'clock, value = 0%) to the current value, in
+// the Palette's primary colour.
 //
 // Interaction: vertical drag on the knob maps 1:1 to value (drag up to
 // increase). Holding Shift while dragging reduces sensitivity by ~5x for
@@ -17,6 +18,7 @@
 #include <JuceHeader.h>
 
 #include <functional>
+#include <memory>
 
 #include "../lookandfeel/Palette.h"
 
@@ -27,27 +29,30 @@ class Knob : public juce::Component,
 public:
     using OnChange = std::function<void(double)>;
 
-    // Default overall size (disc + outer ring). Hosts can call setSize()
-    // to override. Sized so the disc reads as a 100-class control with
-    // comfortable margin around the outer ring.
+    // Default overall size (SVG disc + outer value arc). Hosts can call
+    // setSize() to override. Sized so the SVG disc reads as the main
+    // visual mass with a small margin for the value arc.
     static constexpr int kDefaultSize = 130;
 
-    // Outer-ring padding: how far OUTSIDE the disc the ring lives,
-    // measured from the disc edge to the centre of the value arc. The
-    // total of (padding + ring strokes + safety margin) is reserved
-    // inside the bounds so the ring is never clipped.
-    static constexpr float kRingPadding = 5.0f;
+    // Small visible gap between the SVG's outer dark ring and the value
+    // arc, measured from the SVG's outer edge to the centre of the arc
+    // stroke. With kArcGap = 0 the arc would kiss the SVG; small gap
+    // reads as "this is a separate, animated value indicator".
+    static constexpr float kArcGap = 2.0f;
     // Stroke width (px) of the value arc.
-    static constexpr float kArcThickness = 4.0f;
-    // Stroke width (px) of the track behind the value arc.
-    static constexpr float kTrackThickness = 2.0f;
-    // Small visible gap between the value arc and the track, so the
-    // two strokes read as two distinct concentric rings.
-    static constexpr float kInterArcGap = 2.0f;
+    static constexpr float kArcThickness = 3.0f;
+
     // Indicator dot radius (px).
-    static constexpr float kDotRadius = 3.6f;
-    // Inset of the indicator dot from the disc rim, inwards.
-    static constexpr float kDotInset = 8.0f;
+    static constexpr float kDotRadius = 1.8f;
+    // Inset (px) of the indicator dot from the SVG's outer edge, inwards
+    // toward the centre, expressed as a fraction of the SVG outer
+    // radius. The dot sits in the highlight gap between the SVG's
+    // outermost dark ring and the next ring inward, biased toward the
+    // inner ring. Tuned from the rendered Knob.svg: outer dark ring
+    // outer-edge at r=78, second dark ring at r=60.5, highlight gap
+    // centred around r=68. We place the dot at r=63 (closer to the
+    // inner ring) = 0.78 × R_svg, i.e. 0.22 × R_svg inset.
+    static constexpr float kDotInsetFrac = 0.18f;
 
     // Total angular sweep, measured clockwise from the min angle to the
     // max angle. 7 o'clock → 5 o'clock through 12 o'clock is 150°.
@@ -104,6 +109,10 @@ private:
     bool dragging = false;
     int dragStartY = 0;
     double dragStartValue = 0.0;
+
+    // Cached Knob.svg, parsed lazily on first paint so we don't pay the
+    // parse cost for knobs that are constructed but never displayed.
+    std::unique_ptr<juce::Drawable> discDrawable;
 
     juce::Point<float> getCentre() const;
     float getRadius() const;

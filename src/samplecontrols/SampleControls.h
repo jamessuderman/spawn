@@ -1,10 +1,10 @@
 // Spawn — SampleControls.
-// A transparent container strip below the Display that hosts the
-// "sample-level" controls for the project (knobs, sliders, future
-// widgets). It deliberately has no background of its own — its only
-// job is to lay out the controls horizontally so the host doesn't
-// have to manage those bounds. Today this is a single Knob to the
-// left; new sample-level widgets go here as the project grows.
+// A square container that hosts the "sample-level" controls for the
+// project (today: a single volume Knob). It deliberately has no
+// background of its own — its only job is to lay out the controls so
+// the host doesn't have to manage those bounds. Sized to fit the Knob
+// at its default size; new sample-level widgets go here as the
+// project grows.
 
 #pragma once
 
@@ -20,8 +20,9 @@ class Knob;
 
 class SampleControls : public juce::Component {
 public:
-    // Strip height in pixels.
-    static constexpr int kHeight = 150;
+    // Square edge length in pixels. Sized to match the Knob's footprint
+    // so the container wraps the knob with no extra padding.
+    static constexpr int kSize = 50;
 
     explicit SampleControls(Palette& palette);
     ~SampleControls() override;

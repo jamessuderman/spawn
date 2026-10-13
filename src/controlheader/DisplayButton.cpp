@@ -1,12 +1,17 @@
 #include "DisplayButton.h"
 
+#include <BinaryData.h>
+
 #include "../ui/fonts/Fonts.h"
 
 namespace spawn::ui {
 
 namespace {
 
-constexpr float kCornerRadius = 4.0f;
+// Translucent overlay painted on top of the SVG pill when the button is
+// hovered. The SVG carries its own dark fill + stroke highlight, so the
+// hover affordance is a soft brightening layer rather than a recolour.
+constexpr float kHoverOverlayAlpha = 0.10f;
 
 } // namespace
 
@@ -71,20 +76,32 @@ void DisplayButton::paint(juce::Graphics& g)
 {
     auto bounds = getLocalBounds().toFloat();
 
-    // Panel background — matches the WaveformView/Display panel fill so
-    // the button reads as part of the same hardware-strip family. Idle is
-    // the flat panel fill; hover brightens it slightly. The active toggle
-    // changes only the icon/label colour, not the chip fill — the chip
-    // stays the same neutral panel so the affordance reads as "this state
-    // is on" rather than "this control is a different colour."
-    juce::Colour fill = palette.panelFill();
-    if (hovered)        fill = palette.panelFill().brighter(0.05f);
+    // Pill background — the Button.svg carries the panel fill, the soft
+    // stroke highlight, and the rounded corners. Parsed lazily on first
+    // paint; subsequent paints reuse the cached drawable. SVG colours
+    // stay hard-coded as authored.
+    if (bgDrawable == nullptr)
+    {
+        bgDrawable = juce::Drawable::createFromImageData(
+            BinaryData::Button_svg,
+            static_cast<size_t>(BinaryData::Button_svgSize));
+    }
+    if (bgDrawable != nullptr)
+        bgDrawable->drawWithin(g, bounds,
+                               juce::RectanglePlacement::stretchToFit, 1.0f);
 
-    g.setColour(fill);
-    g.fillRoundedRectangle(bounds, kCornerRadius);
-
-    // No border — the rounded panel fill is enough to read as a chip
-    // against the control header background.
+    // Hover affordance: soft white overlay on top of the SVG. Sits in
+    // the same family as the SVG's own stroke highlight so the hover
+    // reads as "the chip got slightly brighter" rather than "the chip
+    // got a different colour". Active state intentionally leaves the
+    // pill alone — only the icon/label changes — so the affordance
+    // reads as "this state is on" rather than "this control is a
+    // different colour".
+    if (hovered)
+    {
+        g.setColour(juce::Colours::white.withAlpha(kHoverOverlayAlpha));
+        g.fillRect(bounds);
+    }
 
     // Foreground (icon + label) tint: ember when active, white when
     // hovered, bone @ 80% at rest.

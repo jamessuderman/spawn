@@ -1,5 +1,7 @@
 #include "Knob.h"
 
+#include <BinaryData.h>
+
 namespace spawn::ui {
 
 namespace {
@@ -13,6 +15,13 @@ constexpr double kFineMultiplier  = 8.0;
 // Snap-to-default on double-click happens within this radius of the knob
 // centre, so clicking on the arc/dot area also resets.
 constexpr float kDoubleClickRadiusFactor = 1.2f;
+
+// The rendered Knob.svg has its outer dark ring at radius 78 of a 165×165
+// viewBox (centred at 82, 82). Normalising to the SVG's effective outer
+// radius: 78 / 82 ≈ 0.9512. We draw the SVG into a square disc rect sized
+// to that fraction of getRadius() so the SVG's outer edge lands on
+// getRadius() from the centre.
+constexpr float kSvgOuterRadiusFrac = 0.9512f;
 
 } // namespace
 
@@ -81,22 +90,14 @@ juce::Point<float> Knob::getCentre() const
 
 float Knob::getRadius() const
 {
-    // The disc is sized so that the outermost stroke of the outer ring
-    // (the track) lands inside the component bounds with a small safety
-    // margin so the rounded stroke caps don't kiss the edge.
-    //   disc edge         = radius
-    //   value arc centre  = radius + kRingPadding
-    //   arc outer edge    = arc centre + kArcThickness/2
-    //   track centre      = arc outer + kInterArcGap + kTrackThickness/2
-    //   track outer edge  = track centre + kTrackThickness/2
-    // The last must be <= halfMin - kSafetyMargin.
+    // The SVG disc fills out to `radius` from the centre, and the value
+    // arc lives in the band from `radius` to `radius + kArcGap +
+    // kArcThickness/2`. The outer edge of that band must stay inside the
+    // bounds with a small safety margin so the rounded stroke caps don't
+    // kiss the edge.
     const float halfMin = juce::jmin(getWidth(), getHeight()) * 0.5f;
     constexpr float kSafetyMargin = 1.0f;
-    const float ringFootprint = kRingPadding
-                              + kArcThickness * 0.5f
-                              + kInterArcGap
-                              + kTrackThickness;
-    return halfMin - ringFootprint - kSafetyMargin;
+    return halfMin - kArcGap - kArcThickness * 0.5f - kSafetyMargin;
 }
 
 void Knob::paint(juce::Graphics& g)
@@ -106,49 +107,30 @@ void Knob::paint(juce::Graphics& g)
 
     g.saveState();
 
-    // --- Disc: flat panel-fill colour. No shading, no shadow, no rim.
+    // --- Disc: parse Knob.svg lazily on the first paint. Subsequent
+    // paints reuse the cached drawable. SVG colours stay hard-coded as
+    // authored (no palette tinting).
+    if (discDrawable == nullptr)
     {
-        g.setColour(palette.panelFill());
-        g.fillEllipse(centre.x - radius, centre.y - radius,
-                      radius * 2.0f, radius * 2.0f);
+        discDrawable = juce::Drawable::createFromImageData(
+            BinaryData::Knob_svg,
+            static_cast<size_t>(BinaryData::Knob_svgSize));
+    }
+    if (discDrawable != nullptr)
+    {
+        const float discExtent = radius * kSvgOuterRadiusFrac;
+        const juce::Rectangle<float> discBounds(
+            centre.x - discExtent, centre.y - discExtent,
+            discExtent * 2.0f, discExtent * 2.0f);
+        discDrawable->drawWithin(g, discBounds,
+                                 juce::RectanglePlacement::centred, 1.0f);
     }
 
-    // --- Disc border: same `borderIdle` colour and 1-px stroke the
-    // Display panel uses, so the knob reads as part of the same panel
-    // chrome family.
+    // --- Value arc: sits OUTSIDE the SVG's outer dark ring, with a
+    // small visible gap (kArcGap) and NO track. From the "min" angle
+    // (7 o'clock) clockwise to the current value.
     {
-        g.setColour(palette.borderIdle());
-        // Inset by 0.5 px so the stroke sits centred on the disc edge
-        // instead of being clipped to half-pixel slivers.
-        g.drawEllipse(centre.x - radius + 0.5f, centre.y - radius + 0.5f,
-                      radius * 2.0f - 1.0f, radius * 2.0f - 1.0f,
-                      1.0f);
-    }
-
-    // --- Outer ring: track + value arc sit OUTSIDE the disc.
-    const float arcR   = radius + kRingPadding;
-    const float trackR = arcR + kArcThickness * 0.5f
-                              + kInterArcGap
-                              + kTrackThickness * 0.5f;
-
-    // Background track: a dim full-sweep ring from min → max.
-    {
-        juce::Path track;
-        track.addCentredArc(centre.x, centre.y,
-                            trackR, trackR,
-                            0.0f,
-                            kMinAngleRadians,
-                            kMinAngleRadians + kSweepRadians,
-                            true);
-        g.setColour(palette.panelFill().darker(0.30f));
-        g.strokePath(track, juce::PathStrokeType(kTrackThickness,
-                                                 juce::PathStrokeType::curved,
-                                                 juce::PathStrokeType::rounded));
-    }
-
-    // Value arc: the same min → min + (sweep * normalised) segment in
-    // primary. Sits inside the track ring (closer to the disc).
-    {
+        const float arcR = radius + kArcGap + kArcThickness * 0.5f;
         const float valueAngle = valueToAngle(getNormalized());
         juce::Path arc;
         arc.addCentredArc(centre.x, centre.y,
@@ -163,15 +145,14 @@ void Knob::paint(juce::Graphics& g)
                                                juce::PathStrokeType::rounded));
     }
 
-    // --- Indicator dot: at the current value angle, INSIDE the disc
-    // near the rim. Points to the value along the same angular track
-    // as the outer ring (so dot at 7 o'clock = value 0, dot at 5
-    // o'clock = value 100%).
+    // --- Indicator dot: at the current value angle, in the highlight
+    // gap between the SVG's outer dark ring and the next ring inward,
+    // biased toward the inner ring (i.e. further toward the centre).
     {
         const float dotAngle = valueToAngle(getNormalized());
-        const float dotR = radius - kDotInset;
-        const float dx = centre.x + std::sin(dotAngle) * dotR;
-        const float dy = centre.y - std::cos(dotAngle) * dotR;
+        const float dotOrbit = radius * (1.0f - kDotInsetFrac);
+        const float dx = centre.x + std::sin(dotAngle) * dotOrbit;
+        const float dy = centre.y - std::cos(dotAngle) * dotOrbit;
         g.setColour(palette.primary());
         g.fillEllipse(dx - kDotRadius, dy - kDotRadius,
                       kDotRadius * 2.0f, kDotRadius * 2.0f);

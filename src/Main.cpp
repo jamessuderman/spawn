@@ -240,47 +240,67 @@ namespace
                 {
                     // Layout, top to bottom:
                     //   ┌──────────────────────────────────────────────┐
-                    //   │ kOuterPaddingTop = 16 px                    │
-                    //   │ ControlHeader  (kOuterPaddingX inset)        │
-                    //   │ Toolbar        (kOuterPaddingX inset, kGap)  │
-                    //   │ Display        (full width, Display::kHeight)│
-                    //   │ SampleControls (kOuterPaddingX inset, kGap)  │
-                    //   │ (no bottom margin)                           │
+                    //   │ kOuterPaddingY = 16 px                     │
+                    //   │ kHeaderRow tall, full width                │
+                    //   │   ┌──────────────────────┐ ┌────────────┐   │
+                    //   │   │ ControlHeader (left) │ │ Sample     │   │
+                    //   │   │ Toolbar      (left) │ │ Controls   │   │
+                    //   │   │ (column, gap inside) │ │ (knob)     │   │
+                    //   │   └──────────────────────┘ └────────────┘   │
+                    //   │ kGap                                         │
+                    //   │ Display (full width, Display::kHeight)      │
                     //   └──────────────────────────────────────────────┘
-                    auto topStackBounds = getLocalBounds()
-                                          .withZeroOrigin()
-                                          .reduced(kOuterPaddingX, 0);
+                    // The header row is a single horizontal band that
+                    // contains a left column (display buttons on top of
+                    // tool buttons) and a right side (the volume knob).
+                    // Both columns sit inside the same row so the knob
+                    // can never overlap the button strips.
+                    const int headerRowHeight = juce::jmax(
+                        spawn::ui::ControlHeader::kHeight + kGap
+                            + spawn::ui::Toolbar::kHeight,
+                        spawn::ui::SampleControls::kSize);
 
-                    auto headerBounds = topStackBounds;
-                    headerBounds.setY(kOuterPaddingY);
+                    auto topRow = getLocalBounds().withZeroOrigin()
+                                                .reduced(kOuterPaddingX, 0);
+                    topRow.setY(kOuterPaddingY);
+                    topRow.setHeight(headerRowHeight);
+
+                    // Left column: ControlHeader top-aligned, Toolbar
+                    // bottom-aligned so the two strips read as a stacked
+                    // pair hugging the top and bottom of the row (the
+                    // Toolbar then sits flush with the row's bottom edge,
+                    // directly above the Display below).
+                    auto leftColumn = topRow;
+                    leftColumn.setWidth(juce::jmax(0,
+                        topRow.getWidth() - kGap
+                            - spawn::ui::SampleControls::kSize));
+
+                    auto headerBounds = leftColumn;
                     headerBounds.setHeight(spawn::ui::ControlHeader::kHeight);
                     controlHeader->setBounds(headerBounds);
 
-                    auto toolbarBounds = topStackBounds;
-                    toolbarBounds.setY(kOuterPaddingY
-                        + spawn::ui::ControlHeader::kHeight + kGap);
+                    auto toolbarBounds = leftColumn;
+                    toolbarBounds.setY(leftColumn.getBottom()
+                        - spawn::ui::Toolbar::kHeight);
                     toolbarBounds.setHeight(spawn::ui::Toolbar::kHeight);
                     toolbar->setBounds(toolbarBounds);
 
-                    auto displayBounds = getLocalBounds().withZeroOrigin().reduced(kOuterPaddingX);
-                    displayBounds.setY(kOuterPaddingY
-                        + spawn::ui::ControlHeader::kHeight
-                        + kGap
-                        + spawn::ui::Toolbar::kHeight
-                        + kGap);
+                    // Right side of the header row: the volume knob,
+                    // square, vertically centred in the row.
+                    auto sampleBounds = topRow.removeFromRight(
+                        spawn::ui::SampleControls::kSize);
+                    sampleBounds.setY(topRow.getY()
+                        + (headerRowHeight - sampleBounds.getHeight()) / 2);
+                    sampleBounds.setSize(spawn::ui::SampleControls::kSize,
+                                         spawn::ui::SampleControls::kSize);
+                    sampleControls->setBounds(sampleBounds);
+
+                    // Display sits below the header row, full width.
+                    auto displayBounds = getLocalBounds().withZeroOrigin()
+                                                     .reduced(kOuterPaddingX);
+                    displayBounds.setY(kOuterPaddingY + headerRowHeight + kGap);
                     displayBounds.setHeight(spawn::ui::Display::kHeight);
                     display->setBounds(displayBounds);
-
-                    auto sampleBounds = topStackBounds;
-                    sampleBounds.setY(kOuterPaddingY
-                        + spawn::ui::ControlHeader::kHeight
-                        + kGap
-                        + spawn::ui::Toolbar::kHeight
-                        + kGap
-                        + spawn::ui::Display::kHeight
-                        + kGap);
-                    sampleBounds.setHeight(spawn::ui::SampleControls::kHeight);
-                    sampleControls->setBounds(sampleBounds);
                 }
 
             private:

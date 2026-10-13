@@ -14,6 +14,7 @@
 #include <JuceHeader.h>
 
 #include <functional>
+#include <memory>
 
 #include "../ui/icons/Icon.h"
 #include "../ui/icons/Icons.h"
@@ -85,6 +86,12 @@ private:
 
     // Font for the label — Public Sans UI per UI.md § Typography.
     juce::Font labelFont;
+
+    // Cached Button.svg pill background, parsed lazily on first paint so
+    // we don't pay the parse cost for buttons that are constructed but
+    // never displayed. SVG colours stay hard-coded as authored (no palette
+    // tinting of the pill body).
+    std::unique_ptr<juce::Drawable> bgDrawable;
 };
 
 } // namespace spawn::ui

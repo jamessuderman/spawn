@@ -79,13 +79,10 @@ public:
     // Save on the settings view).
     void setAction(Icons::Id icon, OnActionClick onClick);
 
-    // Append an additional right-side action button. Actions stack from
-    // the right edge outward: the FIRST action (whether placed via
-    // setAction or addAction) sits at the rightmost position, the
-    // second sits to its left, etc. Add then set adds them in that
-    // visual order. Used when a content view needs more than one
-    // action beside the tools (e.g. Open + Reset-zoom on the waveform
-    // view).
+    // Append an additional action button. Actions flow left-to-right in
+    // add-order, immediately after the tools (with the same gap). Use
+    // when a content view needs more than one action beside the tools
+    // (e.g. Open + Reset-zoom on the waveform view).
     ActionHandle addAction(Icons::Id icon, OnActionClick onClick);
 
     // Remove all action buttons. Tools are preserved.

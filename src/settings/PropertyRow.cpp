@@ -27,6 +27,12 @@ PropertyRow::PropertyRow(const juce::String& labelText,
 
 PropertyRow::~PropertyRow() = default;
 
+void PropertyRow::setValueInsets(juce::BorderSize<int> insets)
+{
+    valueInsets = insets;
+    resized();
+}
+
 void PropertyRow::paint(juce::Graphics& g)
 {
     // Bottom divider at 12% Bone — reads as a list separator.
@@ -48,17 +54,19 @@ void PropertyRow::resized()
 
     if (valueComp != nullptr)
     {
-        // Slot is the value comp's natural size, vertically centred inside
-        // the row, and pinned `kValueTrailingGap` from the right edge. The
-        // swatch (16x16) thus stays a circle and lines up vertically with
-        // the label.
+        // The value sits at its natural size (set by the caller before
+        // the row is laid out — typically via setSize in the value
+        // component's constructor), vertically centred inside the row,
+        // and pinned to the row's right edge minus kValueTrailingGap.
+        // valueInsets shrinks the available slot from the top/right/
+        // bottom/left so a control can opt into margin around itself.
         const int w = valueComp->getWidth();
         const int h = valueComp->getHeight();
-        valueComp->setBounds(
-            bounds.getRight() - w - kValueTrailingGap,
-            (bounds.getHeight() - h) / 2,
-            w,
-            h);
+        const int availW = juce::jmax(0, w - valueInsets.getLeft() - valueInsets.getRight());
+        const int availH = juce::jmax(0, h - valueInsets.getTop() - valueInsets.getBottom());
+        const int x = bounds.getRight() - w - kValueTrailingGap + valueInsets.getLeft();
+        const int y = (bounds.getHeight() - h) / 2 + valueInsets.getTop();
+        valueComp->setBounds(x, y, availW, availH);
     }
 }
 

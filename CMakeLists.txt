@@ -50,6 +50,8 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/pencil.svg
             resources/icons/lucide/scan.svg
             resources/icons/lucide/squares-subtract.svg
+            resources/assets/Knob.svg
+            resources/assets/Button.svg
             resources/licences/LICENCE-PublicSans.md
             resources/licences/LICENCE-Lucide.md)
 
@@ -71,6 +73,7 @@ if(SPAWN_BUILD_STANDALONE)
             src/settings/ThemeColorSwatch.cpp
             src/stores/SettingsStore.cpp
             src/ui/fonts/Fonts.cpp
+            src/ui/iconlabel/IconLabel.cpp
             src/ui/icons/Icon.cpp
             src/ui/icons/Icons.cpp
             src/ui/knob/Knob.cpp

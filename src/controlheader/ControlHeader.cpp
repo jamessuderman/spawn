@@ -85,8 +85,8 @@ void ControlHeader::resized()
 {
     // Each display button sizes itself from DisplayButton::getPreferredBounds()
     // so the icon margin / label padding constants on DisplayButton are the
-    // single source of truth. Waveform + Sequencer are left-aligned in
-    // reading order, Settings is right-aligned.
+    // single source of truth. All three are left-aligned in reading order:
+    // Waveform, Sequencer, Settings — each separated by kButtonGapPx.
     const auto wfBounds = waveformButton->getPreferredBounds();
     waveformButton->setBounds(
         kEdgeMargin,
@@ -103,7 +103,8 @@ void ControlHeader::resized()
 
     const auto stBounds = settingsButton->getPreferredBounds();
     settingsButton->setBounds(
-        getWidth() - stBounds.getWidth() - kEdgeMargin,
+        kEdgeMargin + wfBounds.getWidth() + kButtonGapPx
+                       + seqBounds.getWidth() + kButtonGapPx,
         (getHeight() - stBounds.getHeight()) / 2,
         stBounds.getWidth(),
         stBounds.getHeight());

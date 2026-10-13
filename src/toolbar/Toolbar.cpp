@@ -115,8 +115,10 @@ void Toolbar::resized()
 
 void Toolbar::layoutButtons()
 {
-    // Left-to-right: tools in add-order, then a gap, then the action
-    // buttons pinned to the right edge in the order they were added.
+    // Left-to-right in add-order: tools, then a gap, then actions. All
+    // buttons share the same row and the same left-edge margin; nothing
+    // is right-aligned so the whole strip reads as one horizontal
+    // sequence of icons.
     int x = kEdgeMargin;
     const int yCentre = getHeight() / 2;
     for (auto& t : tools)
@@ -127,22 +129,12 @@ void Toolbar::layoutButtons()
         x += b.getWidth() + kButtonGapPx;
     }
 
-    if (!actions.empty())
+    for (auto& a : actions)
     {
-        // Right-aligned stack: the first action gets the rightmost
-        // slot, the second sits to its left, etc. We walk the list
-        // right-to-left so the position math reads naturally.
-        int cursorX = getWidth() - kEdgeMargin;
-        for (auto it = actions.rbegin(); it != actions.rend(); ++it)
-        {
-            const auto b = it->button->getPreferredBounds();
-            cursorX -= b.getWidth();
-            it->button->setBounds(cursorX,
-                                  yCentre - b.getHeight() / 2,
-                                  b.getWidth(),
-                                  b.getHeight());
-            cursorX -= kButtonGapPx;
-        }
+        const auto b = a.button->getPreferredBounds();
+        a.button->setBounds(x, yCentre - b.getHeight() / 2,
+                            b.getWidth(), b.getHeight());
+        x += b.getWidth() + kButtonGapPx;
     }
 }
 
