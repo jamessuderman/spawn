@@ -452,24 +452,37 @@ namespace
                 void populateWaveformTools()
                 {
                     toolbar->clearTools();
+                    // Visual order, left to right:
+                    //   speaker | scissors | x-line | scan | trim | dice | folder
+                    //
+                    // The first three are tool slots: speaker and
+                    // scissors are latching (route to onWaveformToolPicked);
+                    // x-line is also a tool slot but it's a one-shot
+                    // destructive action — it fires clearAllCops without
+                    // latching or routing input. Putting it in the tool
+                    // group keeps the visual order matching the requested
+                    // sequence without giving it latching behaviour.
+                    //
+                    // The remaining four are actions, laid out in
+                    // add-order. FolderOpen goes last so it sits at the
+                    // right edge of the strip.
                     const auto speaker = toolbar->addTool(
                         spawn::ui::Icons::Id::Volume2,
                         [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
                     const auto scissors = toolbar->addTool(
                         spawn::ui::Icons::Id::Scissors,
                         [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
-                    // Right-side actions: Open is the primary slot (rightmost),
-                    // then Reset-Zoom, then Crop/Trim, then Shuffle.
-                    // All four are one-shot; none latches, none clears
-                    // the tool group's active state.
-                    toolbar->setAction(spawn::ui::Icons::Id::FolderOpen,
-                                       [this] { openAudioFile(); });
+                    toolbar->addTool(
+                        spawn::ui::Icons::Id::XLine,
+                        [this](spawn::ui::ToolHandle) { clearAllCops(); });
                     toolbar->addAction(spawn::ui::Icons::Id::Scan,
                                        [this] { resetWaveformZoom(); });
                     toolbar->addAction(spawn::ui::Icons::Id::Crop,
                                        [this] { trimOutsideMarkers(); });
                     toolbar->addAction(spawn::ui::Icons::Id::Dice5,
                                        [this] { shuffleChops(); });
+                    toolbar->addAction(spawn::ui::Icons::Id::AudioLines,
+                                       [this] { openAudioFile(); });
 
                     speakerToolIndex = speaker.index();
                     scissorsToolIndex = scissors.index();
@@ -477,6 +490,11 @@ namespace
                     // Re-latch the previous selection if it's still valid,
                     // otherwise default to Speaker. Push the latched tool
                     // into the view so Scissors can switch its input routing.
+                    // x-line lives at index 2 (after speaker and scissors)
+                    // and is a one-shot, so the relatch gate still
+                    // excludes it correctly: any latched tool index >=
+                    // x-line.index() would be an action (Scan/Trim/etc)
+                    // which can't be latched through this code path.
                     const bool relatchValid =
                         waveformActiveTool.isValid()
                         && waveformActiveTool.index() <= scissors.index();
@@ -738,25 +756,59 @@ namespace
                     }
                     originalOrder.emplace_back(cursorSec, regionEnd);
 
-                    // Permute the indices and apply the same order to
-                    // (a) the chop windows we hand to the engine and
-                    // (b) the cut list we restore into the view. The
-                    // cuts in the view become the *positions* of the
-                    // internal chop boundaries in the new buffer — for
-                    // each chop in the shuffled order, its right
-                    // boundary (or left for the final chop) lands at
-                    // a specific second in the new buffer.
-                    std::vector<int> perm(originalOrder.size());
-                    for (size_t i = 0; i < perm.size(); ++i)
-                        perm[i] = static_cast<int>(i);
+                    // Read the lock state. Locks are positional —
+                    // clipLocked[i] means "the chop at output position
+                    // i is locked to its current content". Unlocked
+                    // positions get a randomised fill from the pool of
+                    // unlocked original clips.
+                    const std::vector<bool> clipLocks =
+                        waveformView->getClipLocks();
+
+                    // If clipLocks.size() doesn't match the chop count
+                    // (e.g. the view was setCuts'd externally and the
+                    // host hasn't been keeping the lock vector in sync),
+                    // fall back to "all unlocked" — every clip is
+                    // eligible for the shuffle pool.
+                    const bool allUnlocked = (clipLocks.size()
+                        != originalOrder.size());
+
+                    // Build the pool of unlocked clip indices. If all
+                    // clips are locked, the pool is empty and we
+                    // no-op (nothing to shuffle).
+                    std::vector<int> unlockedPool;
+                    unlockedPool.reserve(originalOrder.size());
+                    for (size_t i = 0; i < originalOrder.size(); ++i)
+                    {
+                        if (allUnlocked || !clipLocks[i])
+                            unlockedPool.push_back(static_cast<int>(i));
+                    }
+                    if (unlockedPool.size() < 1)
+                        return;
+                    // Single unlocked clip = nothing to permute. Skip
+                    // the engine swap; cuts and locks stay put.
+                    if (unlockedPool.size() < 2)
+                        return;
+
                     std::random_device rd;
                     std::mt19937 rng(rd());
-                    std::shuffle(perm.begin(), perm.end(), rng);
+                    std::shuffle(unlockedPool.begin(),
+                                 unlockedPool.end(), rng);
 
+                    // Walk output positions. For each position i:
+                    //   - if locked (and not allUnlocked): output[i] = i.
+                    //   - else: take the next free clip from the
+                    //     shuffled unlockedPool.
                     std::vector<std::pair<double, double>> shuffledWindows;
-                    shuffledWindows.reserve(perm.size());
-                    for (const int idx : perm)
-                        shuffledWindows.push_back(originalOrder[idx]);
+                    shuffledWindows.reserve(originalOrder.size());
+                    size_t poolCursor = 0;
+                    for (size_t i = 0; i < originalOrder.size(); ++i)
+                    {
+                        const bool locked = !allUnlocked && clipLocks[i];
+                        const int srcIdx = locked
+                            ? static_cast<int>(i)
+                            : unlockedPool[poolCursor++];
+                        shuffledWindows.push_back(originalOrder[srcIdx]);
+                    }
 
                     // Build the new cuts list for the view. The new
                     // buffer's length is sum(window sizes) — same as
@@ -764,7 +816,7 @@ namespace
                     // each new cut position by summing the lengths of
                     // preceding chops in the shuffled order.
                     std::vector<double> newCuts;
-                    newCuts.reserve(perm.size() - 1);
+                    newCuts.reserve(shuffledWindows.size() - 1);
                     double accum = 0.0;
                     for (size_t i = 0; i + 1 < shuffledWindows.size(); ++i)
                     {
@@ -791,6 +843,30 @@ namespace
                     // cleared the cuts; setCuts restores them at the
                     // boundaries of the shuffled concatenation.
                     waveformView->setCuts(std::move(newCuts));
+                    // Locks are positional, so the same lock pattern
+                    // (clipLocked[i] = "output position i is locked")
+                    // is still correct after shuffle — setClipLocks
+                    // restores them at the new clip positions.
+                    waveformView->setClipLocks(clipLocks);
+                }
+
+                // Clear every internal cut boundary in the active region. The
+                // audio buffer is untouched — only the model's chop
+                // list changes. The active region [startSeconds,
+                // endSeconds] is preserved so the user can keep
+                // editing within the same window they were zoomed
+                // into; the selection is reset to cover the full
+                // region.
+                //
+                // One-shot action wired to the toolbar's x-line
+                // icon. No-op when no buffer is loaded.
+                void clearAllCops()
+                {
+                    if (waveformView == nullptr)
+                        return;
+                    if (!engine.hasBuffer())
+                        return;
+                    waveformView->clearCuts();
                 }
 
                 // Called from the WaveformView's OnFileLoaded hook (which

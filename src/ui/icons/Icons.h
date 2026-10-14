@@ -32,6 +32,8 @@ public:
         Square,
         Repeat2,
         Dice5,
+        XLine,
+        Lock,
     };
 
     // Parse and cache the icon at the requested pixel size.

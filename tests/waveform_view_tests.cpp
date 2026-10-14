@@ -550,6 +550,344 @@ public:
                                   engine.getSourceSampleRate());
             expectEquals(view.getEndSeconds(), 0.25);
         }
+
+        beginTest("clearCuts: removes every cut and resets selection "
+                  "to the active region");
+        {
+            // The "clear all chops" toolbar button: drop every
+            // internal cut and re-select the full region, leaving
+            // start/end markers untouched. After clearing, the
+            // model should look like a freshly-loaded sample.
+            auto dir = makeTempDir("clear_cuts");
+            const auto file = writeSilentWav(dir); // 1 s, 44.1 kHz
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            // Add a few cuts.
+            expect(view.addCut(0.2));
+            expect(view.addCut(0.5));
+            expect(view.addCut(0.8));
+            expectEquals(static_cast<int>(view.getCuts().size()), 3);
+
+            // Narrow the active region — clearCuts must preserve it.
+            view.setChopRegion(0.1, 0.9);
+            expectEquals(view.getStartSeconds(), 0.1);
+            expectEquals(view.getEndSeconds(),   0.9);
+
+            // Set a selection to a single chop (so we can verify
+            // clearCuts resets it to the active region).
+            view.setSelectedClip(0.5, 0.8);
+            double selStart = 0.0, selEnd = 0.0;
+            view.getSelectedClip(selStart, selEnd);
+            expectEquals(selStart, 0.5);
+            expectEquals(selEnd,   0.8);
+
+            view.clearCuts();
+
+            // Every cut is gone.
+            expectEquals(static_cast<int>(view.getCuts().size()), 0);
+
+            // Active region is preserved.
+            expectEquals(view.getStartSeconds(), 0.1);
+            expectEquals(view.getEndSeconds(),   0.9);
+
+            // Selection is reset to the active region.
+            view.getSelectedClip(selStart, selEnd);
+            expectEquals(selStart, 0.1);
+            expectEquals(selEnd,   0.9);
+        }
+
+        beginTest("clearCuts: no-op when cuts are already empty");
+        {
+            // Calling clearCuts on a freshly-loaded sample must be
+            // harmless — no crash, no spurious repaint side effects,
+            // and the selection stays as it was (which is the full
+            // region by default).
+            auto dir = makeTempDir("clear_cuts_noop");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expectEquals(static_cast<int>(view.getCuts().size()), 0);
+            view.clearCuts();
+            expectEquals(static_cast<int>(view.getCuts().size()), 0);
+            expectEquals(view.getStartSeconds(), 0.0);
+            expectEquals(view.getEndSeconds(),   1.0);
+        }
+
+        beginTest("applyMarkerDrag(Cut): drag a cut between two "
+                  "neighbours does not trip MSVC's vector iterator check");
+        {
+            // Regression for a real crash the user reported as
+            // "vector iterators incompatible" while chopping
+            // without playback. The bug was in applyMarkerDrag's
+            // Cut branch: it computed activeCutIndex via
+            // `insertionPoint - cuts.begin()` AFTER calling
+            // cuts.insert, which invalidates both iterators. MSVC's
+            // debug-mode STL fires the "vector iterators
+            // incompatible" assertion on that subtraction. The fix
+            // captures the integer offset BEFORE the insert.
+            //
+            // Reproduce: load a sample, add three cuts, drag the
+            // middle cut through several positions. Each drag
+            // event hits the erase/insert path. Without the fix,
+            // the second or third drag event trips the assertion.
+            auto dir = makeTempDir("cut_drag_regression");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.2));
+            expect(view.addCut(0.5));
+            expect(view.addCut(0.8));
+            expectEquals(static_cast<int>(view.getCuts().size()), 3);
+
+            // Drag the middle cut (index 1) through a sequence of
+            // positions. Each call goes through the erase + insert
+            // path. Before the fix, the second call onwards would
+            // trip MSVC's iterator check on the post-insert
+            // subtraction. We exercise enough positions to cover
+            // the reordering edge cases (cut moves to a different
+            // slot in the list, requiring lower_bound to land
+            // before vs after the previous activeCutIndex).
+            const juce::Rectangle<int> bounds(0, 0, 1000, 200);
+            for (const double t : { 0.30, 0.40, 0.55, 0.65, 0.75,
+                                    0.45, 0.35, 0.50 })
+            {
+                const int x = static_cast<int>(
+                    juce::jmap(t, 0.0, 1.0,
+                               static_cast<double>(bounds.getX()),
+                               static_cast<double>(bounds.getRight())));
+                view.applyMarkerDrag(
+                    WaveformView::DragTarget::Cut, x, bounds);
+            }
+
+            // Cuts list should still be sane — three entries, all
+            // inside the sample bounds.
+            const auto cuts = view.getCuts();
+            expectEquals(static_cast<int>(cuts.size()), 3);
+            for (const double c : cuts)
+            {
+                expect(c > 0.0);
+                expect(c < 1.0);
+            }
+            // Cuts must remain sorted ascending.
+            for (size_t i = 1; i < cuts.size(); ++i)
+                expect(cuts[i] > cuts[i - 1]);
+        }
+
+        beginTest("hitTestClipLock: returns the clip index whose "
+                  "lock icon is at the click point");
+        {
+            // The lock icon for clip i sits at the top-right of
+            // clip i's slice. Build a 4-clip layout (3 cuts) and
+            // hit-test a sequence of points inside and outside the
+            // icon hit zones. Each clip is ~25% of the visible width,
+            // so the icon should land in the rightmost ~16 px of
+            // each slice.
+            auto dir = makeTempDir("hit_lock");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.25));
+            expect(view.addCut(0.50));
+            expect(view.addCut(0.75));
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 4);
+
+            const juce::Rectangle<int> bounds(0, 0, 1000, 200);
+
+            // Each clip slice spans 250 px (1000/4). The lock icon
+            // is 12 px wide, 4 px from the right edge. Icon centre x
+            // for clip i = sliceRight - kIconMargin - kIconSize/2.
+            // Slice right for clip 0 = 250, icon centre ≈ 234.
+            // Slice right for clip 3 = 1000, icon centre ≈ 984.
+            auto iconCentreX = [&](int clipIdx)
+            {
+                const double sliceRight = static_cast<double>(
+                    (clipIdx + 1) * 250);
+                return sliceRight - 4.0 - 6.0; // kIconMargin + kIconSize/2
+            };
+            auto iconCentreY = [&]() { return 4.0 + 6.0; }; // kIconMargin + kIconSize/2
+
+            for (int i = 0; i < 4; ++i)
+            {
+                const int x = static_cast<int>(iconCentreX(i));
+                const int y = static_cast<int>(iconCentreY());
+                expectEquals(view.hitTestClipLock(x, y, bounds), i);
+            }
+
+            // Click far below the icon (e.g. middle of the slice) —
+            // no lock at that point.
+            expectEquals(view.hitTestClipLock(125, 100, bounds), -1);
+
+            // Click just outside the right edge of clip 0's lock
+            // (icon ends at ~240 + 2 (hit margin) ≈ 242; click at
+            // 245 should miss).
+            expectEquals(view.hitTestClipLock(245, 10, bounds), -1);
+        }
+
+        beginTest("applyMarkerDrag(Cut): drag a cut to its own "
+                  "position is a no-op (early return)");
+        {
+            // The newT == oldCut early return path bypasses the
+            // erase/insert entirely. Must not trip the iterator
+            // check either (it didn't before, but make sure the
+            // fix doesn't regress this path).
+            auto dir = makeTempDir("cut_drag_noop");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.4));
+            expect(view.addCut(0.6));
+
+            const juce::Rectangle<int> bounds(0, 0, 1000, 200);
+            const int x = static_cast<int>(
+                juce::jmap(0.5, 0.0, 1.0,
+                           static_cast<double>(bounds.getX()),
+                           static_cast<double>(bounds.getRight())));
+            // Drag the middle cut to the same position it
+            // currently occupies (0.5 s = between 0.4 and 0.6,
+            // legal). The implementation's newT == oldCut early
+            // return fires; cuts unchanged.
+            view.applyMarkerDrag(
+                WaveformView::DragTarget::Cut, x, bounds);
+
+            const auto cuts = view.getCuts();
+            expectEquals(static_cast<int>(cuts.size()), 2);
+        }
+
+        beginTest("clip locks: get/set/isClipLocked reflect state, "
+                  "sync with chop list size");
+        {
+            // Lock vector must always be cuts.size() + 1. Add a
+            // cut, then a cut, then a cut — the lock vector grows
+            // alongside. Remove a cut, it shrinks.
+            auto dir = makeTempDir("lock_basic");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            // Fresh sample: one clip, one lock slot, default false.
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 1);
+            expect(!view.isClipLocked(0));
+
+            // Set one lock, verify it sticks.
+            auto locks1 = view.getClipLocks();
+            locks1[0] = true;
+            view.setClipLocks(locks1);
+            expect(view.isClipLocked(0));
+
+            // Add cuts — the lock vector should grow (all unlocked
+            // by default).
+            expect(view.addCut(0.2));
+            expect(view.addCut(0.5));
+            expect(view.addCut(0.8));
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 4);
+            // std::vector::resize(n, false) only adds new elements;
+            // existing ones are untouched. The lock at index 0
+            // (set to true before the addCut calls) survives the
+            // grows.
+            expect(view.isClipLocked(0));
+            expect(!view.isClipLocked(1));
+            expect(!view.isClipLocked(2));
+            expect(!view.isClipLocked(3));
+
+            // Remove a cut — vector shrinks.
+            expect(view.removeCut(0));
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 3);
+        }
+
+        beginTest("clip locks: lock state survives cut drag "
+                  "(cuts.size() unchanged)");
+        {
+            // applyMarkerDrag(Cut) doesn't change cuts.size(), so
+            // the lock vector stays the same size. Lock at index 1
+            // stays at index 1.
+            auto dir = makeTempDir("lock_drag");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.2));
+            expect(view.addCut(0.5));
+            expect(view.addCut(0.8));
+
+            std::vector<bool> locks(4, false);
+            locks[1] = true;
+            view.setClipLocks(locks);
+
+            // Drag the middle cut to a new position (still within the
+            // same set of three cuts, just a different cut value).
+            const juce::Rectangle<int> bounds(0, 0, 1000, 200);
+            const int x = static_cast<int>(juce::jmap(
+                0.4, 0.0, 1.0,
+                static_cast<double>(bounds.getX()),
+                static_cast<double>(bounds.getRight())));
+            view.applyMarkerDrag(
+                WaveformView::DragTarget::Cut, x, bounds);
+
+            // Lock pattern unchanged after the drag.
+            const auto after = view.getClipLocks();
+            expectEquals(static_cast<int>(after.size()), 4);
+            expect(!after[0]);
+            expect(after[1]); // still locked at index 1
+            expect(!after[2]);
+            expect(!after[3]);
+        }
+
+        beginTest("clip locks: clearCuts resets the lock vector");
+        {
+            // After clearCuts the buffer is one big chop. Lock
+            // vector should have exactly one entry (default false).
+            auto dir = makeTempDir("lock_clear");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.3));
+            expect(view.addCut(0.6));
+            std::vector<bool> locks(3, true);
+            view.setClipLocks(locks);
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 3);
+
+            view.clearCuts();
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 1);
+            expect(!view.isClipLocked(0));
+        }
+
+        beginTest("clip locks: reloadFromBuffer resets locks "
+                  "(new buffer means old lock pattern is meaningless)");
+        {
+            auto dir = makeTempDir("lock_reload");
+            const auto file = writeSilentWav(dir);
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            expect(view.addCut(0.5));
+            std::vector<bool> locks(2, true);
+            view.setClipLocks(locks);
+
+            // Drive reloadFromBuffer with a fresh buffer (any
+            // shared_ptr; the path under test is resetForNewSource's
+            // clearing behaviour, which fires from reloadFromBuffer).
+            auto buf = std::make_shared<juce::AudioBuffer<float>>(1, 4096);
+            buf->clear();
+            view.reloadFromBuffer(buf, 44100.0);
+            // After reload, cuts cleared, vector size 1, default false.
+            expectEquals(static_cast<int>(view.getClipLocks().size()), 1);
+            expect(!view.isClipLocked(0));
+        }
     }
 
     void expectSelected(const WaveformView& view, double s, double e)
@@ -561,5 +899,115 @@ public:
     }
 };
 
+// Regression: user reported "playing audio, did some chops, app
+// crashed with vector iterators incompatible" while NOT touching
+// the shuffle feature. The only new code path running during a
+// marker drag while playing is the live loop-update path: drag
+// start/end → notifyChopChanged → host callback → engine.setPlayWindow.
+// Reproduce the marker-drag flow against a playing engine and
+// confirm no crash.
+class WaveformViewChopDragDuringPlaybackRegression
+    : public juce::UnitTest
+{
+public:
+    WaveformViewChopDragDuringPlaybackRegression()
+        : juce::UnitTest("WaveformView chop-drag during playback") {}
+
+    void runTest() override
+    {
+        beginTest("chop-drag during playback does not crash");
+
+        PreviewEngine engine;
+        engine.setBuffer(
+            makeStereoConstantBuffer(48000, 0.5f, 0.5f),
+            48000.0);
+        engine.prepareToPlay(256, 48000.0);
+        engine.setGain(1.0f);
+
+        auto settingsFile = makeTempDir("regression_settings")
+                                .getChildFile("settings.properties");
+        SettingsStore store(settingsFile);
+        Palette palette(store);
+        WaveformView view(palette);
+        view.setPreviewEngine(&engine);
+
+        // Mirror the host's wiring: only push to the engine while
+        // playing, so idle drags don't disturb an idle engine.
+        view.setOnChopRegionChanged(
+            [&engine](double startSec, double endSec)
+            {
+                if (engine.isPlaying())
+                    engine.setPlayWindow(startSec, endSec);
+            });
+
+        auto dir = makeTempDir("regression_file");
+        const auto file = writeSilentWav(dir); // 1 s at 44.1 kHz
+        expect(view.loadFile(file));
+
+        // 1) Start playback, render a block so the engine is in a
+        //    known running state.
+        engine.playFrom(0.0, 1.0);
+        expect(engine.isPlaying());
+        {
+            juce::AudioBuffer<float> out(2, 256);
+            out.clear();
+            juce::AudioSourceChannelInfo info;
+            info.buffer = &out;
+            info.startSample = 0;
+            info.numSamples = 256;
+            engine.getNextAudioBlock(info);
+        }
+
+        // 2) Drag the start marker to 0.1 s while playing.
+        view.setChopRegion(0.1, 1.0);
+
+        // 3) Drag end marker left to 0.8 s while playing.
+        view.setChopRegion(0.1, 0.8);
+
+        // 4) Reset chop to full sample.
+        view.setChopRegion(0.0, 1.0);
+
+        // 5) Render several more blocks after each marker move. If
+        //    any path inside the engine reads a vector while it's
+        //    being mutated, this is where it surfaces.
+        for (int i = 0; i < 10; ++i)
+        {
+            juce::AudioBuffer<float> out(2, 256);
+            out.clear();
+            juce::AudioSourceChannelInfo info;
+            info.buffer = &out;
+            info.startSample = 0;
+            info.numSamples = 256;
+            engine.getNextAudioBlock(info);
+        }
+
+        // 6) Add a cut mid-playback.
+        expect(view.addCut(0.5));
+
+        // 7) Remove the cut we just added.
+        const auto cuts = view.getCuts();
+        if (!cuts.empty())
+            expect(view.removeCut(0));
+
+        // 8) Render more blocks after the cut mutation.
+        for (int i = 0; i < 5; ++i)
+        {
+            juce::AudioBuffer<float> out(2, 256);
+            out.clear();
+            juce::AudioSourceChannelInfo info;
+            info.buffer = &out;
+            info.startSample = 0;
+            info.numSamples = 256;
+            engine.getNextAudioBlock(info);
+        }
+
+        // Final assertions — view state should be coherent.
+        expectEquals(view.getStartSeconds(), 0.0);
+        expect(view.getEndSeconds() > 0.0);
+    }
+};
+
 static WaveformViewCutTests waveformViewCutTests;
 static WaveformViewSelectionUpdateTests waveformViewSelectionUpdateTests;
+static WaveformViewChopDragDuringPlaybackRegression
+    waveformViewChopDragDuringPlaybackRegression;

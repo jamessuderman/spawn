@@ -265,6 +265,10 @@ void WaveformView::resetForNewSource()
     zoomStart    = 0.0;
     zoomEnd      = length;
     cuts.clear();
+    // Locks reference positions in the old buffer's chop list; a new
+    // buffer means the lock pattern no longer maps to anything. Reset
+    // to a single unlocked clip spanning the new full sample.
+    clipLocks.clear();
     selectedClipStart = 0.0;
     selectedClipEnd   = length;
     if (partner != nullptr)
@@ -374,6 +378,68 @@ std::vector<double> WaveformView::getCuts() const
 void WaveformView::setCuts(std::vector<double> newCuts)
 {
     cuts = std::move(newCuts);
+    // Resize the lock vector to match the new clip count. Locks
+    // are positional, so positions beyond the new size drop and any
+    // new positions default to unlocked.
+    syncLockVectorSize();
+    repaint();
+}
+
+std::vector<bool> WaveformView::getClipLocks() const
+{
+    return clipLocks;
+}
+
+void WaveformView::setClipLocks(std::vector<bool> newLocks)
+{
+    // Replace the lock vector. Caller is responsible for matching
+    // size to the chop list — syncLockVectorSize() runs after to
+    // clamp to the actual clip count.
+    clipLocks = std::move(newLocks);
+    syncLockVectorSize();
+}
+
+bool WaveformView::isClipLocked(int clipIndex) const
+{
+    if (clipIndex < 0
+        || clipIndex >= static_cast<int>(clipLocks.size()))
+        return false;
+    return clipLocks[clipIndex];
+}
+
+void WaveformView::syncLockVectorSize()
+{
+    // Lock vector must have exactly cuts.size() + 1 entries — one
+    // flag per clip defined by the chop list. Grow with false (new
+    // clips default unlocked); shrink by dropping trailing entries.
+    const int desired = static_cast<int>(cuts.size()) + 1;
+    if (static_cast<int>(clipLocks.size()) < desired)
+        clipLocks.resize(desired, false);
+    else if (static_cast<int>(clipLocks.size()) > desired)
+        clipLocks.resize(desired);
+}
+
+void WaveformView::clearCuts()
+{
+    // Drop every internal cut boundary and re-select the full
+    // active region. The audio buffer is untouched — only the
+    // model's chop list changes. After this, Scissors addCut calls
+    // operate against a single-chop buffer (the whole region), so a
+    // user starting over from a previously-sliced sample gets the
+    // same behaviour as a fresh load.
+    if (cuts.empty())
+        return; // nothing to clear; selection already covers the region
+    cuts.clear();
+    // All chops gone — single clip spanning the region. Lock list
+    // collapses to a single unlocked entry. syncLockVectorSize()
+    // handles the resize.
+    syncLockVectorSize();
+    // Reset the selection to the active region so the highlight
+    // shows the whole buffer again (otherwise the previous chop's
+    // selection persists and the user sees a tiny highlight after
+    // hitting "clear").
+    selectedClipStart = startSeconds;
+    selectedClipEnd   = endSeconds;
     repaint();
 }
 
@@ -406,6 +472,9 @@ bool WaveformView::addCut(double secondsToAdd)
     // are bounded by the sample length / min-chop-gap.
     const auto pos = std::lower_bound(cuts.begin(), cuts.end(), t);
     cuts.insert(pos, t);
+    // The new cut adds one clip to the right of it; default that
+    // clip to unlocked so existing locks at other positions survive.
+    syncLockVectorSize();
 
     // Scissors rule: the clip to the RIGHT of the new cut is what just
     // got "born" by the cut, so it becomes the selected clip. The left
@@ -444,6 +513,10 @@ bool WaveformView::removeCut(int index)
                                   && (removedCut == selectedClipEnd);
 
     cuts.erase(cuts.begin() + index);
+    // Removing a cut merges two clips into one. Drop the lock of the
+    // cut that just got absorbed (it's the left neighbour of the
+    // merge); other locks at positions that still exist survive.
+    syncLockVectorSize();
 
     // Selection update: when the removed cut was the left edge of
     // the selected clip, the chop to the left of the removed cut
@@ -837,6 +910,20 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
 
     const auto bounds = getLocalBounds();
 
+    // Lock icons take precedence over markers — if the click lands
+    // inside a lock icon's hit zone, toggle the lock and return
+    // without starting a marker drag or click-to-play gesture.
+    if (e.mods.isLeftButtonDown())
+    {
+        const int lockIdx = hitTestClipLock(e.x, e.y, bounds);
+        if (lockIdx >= 0)
+        {
+            clipLocks[lockIdx] = !clipLocks[lockIdx];
+            repaint();
+            return;
+        }
+    }
+
     // Right-click in Scissors mode over a cut marker removes the
     // cut. The cut-removal gesture is mode-gated to Scissors so
     // Speaker mode (the default) keeps its right-click-stops-playback
@@ -1161,6 +1248,64 @@ void WaveformView::drawWaveform(juce::Graphics& g, juce::Rectangle<int> bounds)
     drawSlice(startSeconds, endSeconds, palette.primary());
     // Right muted region: [endSeconds, visEnd] (clipped).
     drawSlice(endSeconds, visEnd, palette.muted());
+
+    drawClipLocks(g, bounds, visStart, visEnd);
+}
+
+void WaveformView::drawClipLocks(juce::Graphics& g,
+                                  juce::Rectangle<int> bounds,
+                                  double visStart,
+                                  double visEnd)
+{
+    // Per-clip lock icon: a small lock at the top-right of each
+    // clip's slice in the active region. Skipped when the slice is
+    // narrower than the icon — too narrow to be a useful target.
+    if (clipLocks.empty())
+        return;
+
+    constexpr int kIconSize = 12;        // px on each side
+    constexpr int kIconMargin = 4;        // px in from the slice's edges
+    const int iconY = bounds.getY() + kIconMargin;
+
+    auto drawOne = [&](int clipXRight, bool locked)
+    {
+        const int iconX = clipXRight - kIconMargin - kIconSize;
+        const juce::Rectangle<int> iconBounds(
+            iconX, iconY, kIconSize, kIconSize);
+        // OFF = labelText (bone white) at 50% alpha; ON = primary
+        // (ember) at full alpha. The Icons draw helper handles
+        // tint via replaceColour.
+        const juce::Colour colour = locked
+            ? palette.primary()
+            : palette.labelText().withAlpha(0.5f);
+        spawn::ui::Icons::draw(
+            g, spawn::ui::Icons::Id::Lock,
+            iconBounds.toFloat(), colour);
+    };
+
+    // Clip list iteration: chop i is the boundary between clip i
+    // and clip i+1. Each clip's right edge is either the next chop
+    // or endSeconds; its left edge is either the prior chop or
+    // startSeconds.
+    const double length = thumbnail.getTotalLength();
+    (void) length; // suppress unused warning if clipLocks.size() == 0
+    double prev = startSeconds;
+    for (size_t i = 0; i < clipLocks.size(); ++i)
+    {
+        const double next = (i + 1 < cuts.size())
+            ? cuts[i]
+            : endSeconds;
+        const double sliceLeft  = juce::jmax(prev, visStart);
+        const double sliceRight = juce::jmin(next, visEnd);
+        if (sliceRight > sliceLeft)
+        {
+            const int sliceRightX = secondsToX(sliceRight, bounds);
+            const int sliceLeftX  = secondsToX(sliceLeft,  bounds);
+            if (sliceRightX - sliceLeftX >= kIconSize + kIconMargin * 2)
+                drawOne(sliceRightX, clipLocks[i]);
+        }
+        prev = next;
+    }
 }
 
 void WaveformView::drawSelectionHighlight(juce::Graphics& g, juce::Rectangle<int> bounds) const
@@ -1431,6 +1576,58 @@ WaveformView::DragTarget WaveformView::hitTestMarker(int x, juce::Rectangle<int>
     return DragTarget::None;
 }
 
+int WaveformView::hitTestClipLock(int x, int y,
+                                  juce::Rectangle<int> bounds) const
+{
+    // Walk through each clip's slice in the active region and
+    // check whether (x, y) is inside that clip's lock-icon hit
+    // zone. Returns the clip index on a hit, -1 on a miss. The
+    // hit zone mirrors the drawn icon plus a small margin so
+    // users can hit it without sub-pixel precision.
+    if (clipLocks.empty())
+        return -1;
+    if (thumbnail.getTotalLength() <= 0.0)
+        return -1;
+
+    constexpr int kIconSize = 12;
+    constexpr int kIconMargin = 4;
+    constexpr int kHitMargin = 2; // extra slack around the icon
+    const int iconY = bounds.getY() + kIconMargin;
+    const int iconBottom = iconY + kIconSize;
+
+    double visStart, visEnd;
+    visibleWindow(visStart, visEnd);
+
+    double prev = startSeconds;
+    for (size_t i = 0; i < clipLocks.size(); ++i)
+    {
+        const double next = (i + 1 < cuts.size())
+            ? cuts[i]
+            : endSeconds;
+        const double sliceLeft  = juce::jmax(prev,   visStart);
+        const double sliceRight = juce::jmin(next,   visEnd);
+        if (sliceRight > sliceLeft)
+        {
+            const int sliceRightX = secondsToX(sliceRight, bounds);
+            const int sliceLeftX  = secondsToX(sliceLeft,  bounds);
+            if (sliceRightX - sliceLeftX >= kIconSize + kIconMargin * 2)
+            {
+                const int iconX = sliceRightX - kIconMargin - kIconSize;
+                // Inflate the hit rect by kHitMargin on every side.
+                const juce::Rectangle<int> hit(
+                    iconX - kHitMargin,
+                    iconY  - kHitMargin,
+                    kIconSize + kHitMargin * 2,
+                    (iconBottom - iconY) + kHitMargin * 2);
+                if (hit.contains(x, y))
+                    return static_cast<int>(i);
+            }
+        }
+        prev = next;
+    }
+    return -1;
+}
+
 void WaveformView::applyMarkerDrag(DragTarget target, int x,
                                    juce::Rectangle<int> bounds)
 {
@@ -1538,9 +1735,18 @@ void WaveformView::applyMarkerDrag(DragTarget target, int x,
         // cut's new slot so the next drag event tracks the same
         // physical cut.
         cuts.erase(cuts.begin() + activeCutIndex);
+        // Capture the insertion offset as an integer BEFORE the
+        // insert — std::vector::insert invalidates all iterators
+        // into the vector, and MSVC's debug-mode iterator check
+        // (vector iterators incompatible) fires on the
+        // `insertionPoint - cuts.begin()` subtraction below if we
+        // do it after the insert. The offset is invariant across
+        // the insert (it points at the position the new element
+        // will occupy), so we can stash it now.
         const auto insertionPoint = std::lower_bound(cuts.begin(), cuts.end(), newT);
+        const int insertionOffset = static_cast<int>(insertionPoint - cuts.begin());
         cuts.insert(insertionPoint, newT);
-        activeCutIndex = static_cast<int>(insertionPoint - cuts.begin());
+        activeCutIndex = insertionOffset;
         if (wasSelectionLeftEdge)
             selectedClipStart = newT;
         if (wasSelectionRightEdge)

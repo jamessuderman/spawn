@@ -37,6 +37,8 @@ const IconSource kSources[] = {
     { BinaryData::square_svg,            BinaryData::square_svgSize },
     { BinaryData::repeat2_svg,           BinaryData::repeat2_svgSize },
     { BinaryData::dice5_svg,              BinaryData::dice5_svgSize },
+    { BinaryData::xline_svg,              BinaryData::xline_svgSize },
+    { BinaryData::lock_svg,               BinaryData::lock_svgSize },
 };
 
 using CacheKey = std::pair<Icons::Id, float>;

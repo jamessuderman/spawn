@@ -55,10 +55,27 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/square.svg
             resources/icons/lucide/repeat-2.svg
             resources/icons/lucide/dice-5.svg
+            resources/icons/lucide/x-line.svg
+            resources/icons/lucide/lock.svg
             resources/assets/Knob.svg
             resources/assets/Button.svg
             resources/licences/LICENCE-PublicSans.md
             resources/licences/LICENCE-Lucide.md)
+
+    # JUCE's juce_add_binary_data splits embedded assets across many
+    # BinaryData*.cpp files. When the SOURCES list above changes (a
+    # new icon is added), the regenerated .cpp files have different
+    # sizes but ninja may keep stale .obj files from a previous
+    # binary data layout, producing LNK1236 'corrupt or invalid COFF
+    # sections' on link. Force a clean rebuild of the binary data
+    # target whenever its build is invoked so stale .obj's can never
+    # leak across an icon addition. The cost is one extra
+    # `Remove-Item` per build invocation (Windows-friendly; cheap).
+    add_custom_target(clean_SpawnAssets ALL
+        COMMAND ${CMAKE_COMMAND} -E remove_directory
+            "${CMAKE_BINARY_DIR}/CMakeFiles/SpawnAssets.dir"
+        COMMENT "Removing stale SpawnAssets .obj files to avoid LNK1236")
+    add_dependencies(SpawnAssets clean_SpawnAssets)
 
     target_sources(SpawnStandalone
         PRIVATE

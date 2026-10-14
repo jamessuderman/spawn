@@ -943,6 +943,70 @@ public:
             engine.getNextAudioBlock(info);
             expect(out.getSample(0, 0) > 0.85f); // first chop is 0.9
         }
+
+        beginTest("setBufferFromChops mid-playback: the dice flow "
+                  "during an active transport must not crash");
+        {
+            // Reproduces the user-reported "playing audio, did some
+            // chops, app crashed (vector iterators incompatible)" by
+            // interleaving render blocks with the dice handler's
+            // engine call sequence. setBufferFromChops stops
+            // playback, swaps the buffer, and resets transport — the
+            // crash was somewhere in this sequence.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000, 0.5f, 0.5f),
+                48000.0);
+            engine.prepareToPlay(256, 48000.0);
+            engine.setGain(1.0f);
+            engine.playFrom(0.0, 1.0);
+            expect(engine.isPlaying());
+
+            // Render a few blocks so the playhead is somewhere in
+            // the middle of the buffer — not at the start.
+            for (int i = 0; i < 5; ++i)
+            {
+                juce::AudioBuffer<float> out(2, 256);
+                out.clear();
+                juce::AudioSourceChannelInfo info;
+                info.buffer = &out;
+                info.startSample = 0;
+                info.numSamples = 256;
+                engine.getNextAudioBlock(info);
+            }
+
+            // Now run the shuffle mid-playback. This is exactly
+            // what the dice button does.
+            engine.setBufferFromChops({
+                { 0.75, 1.00 },
+                { 0.00, 0.25 },
+                { 0.50, 0.75 },
+                { 0.25, 0.50 },
+            });
+
+            // Engine should be stopped, buffer should be the new
+            // shuffled concatenation.
+            expect(!engine.isPlaying());
+            auto buf = engine.getBufferSnapshot();
+            expect(buf != nullptr);
+            expectEquals(buf->getNumSamples(), 48000);
+
+            // Resume playback from the new buffer — the dice
+            // handler stops audio, but a subsequent Play press
+            // (modeled here) should work.
+            engine.playFrom(0.0, 1.0);
+            expect(engine.isPlaying());
+
+            // Render a block to confirm the audio thread can read
+            // from the post-shuffle buffer without use-after-free.
+            juce::AudioBuffer<float> out(2, 256);
+            out.clear();
+            juce::AudioSourceChannelInfo info;
+            info.buffer = &out;
+            info.startSample = 0;
+            info.numSamples = 256;
+            engine.getNextAudioBlock(info);
+        }
     }
 };
 

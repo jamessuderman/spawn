@@ -170,6 +170,33 @@ public:
     // already shifted/dropped cuts on the host side.
     void setCuts(std::vector<double> newCuts);
 
+    // Clear every cut in the active region and reset the selection
+    // to the full region. The start/end markers (active region) are
+    // preserved. Used by the "clear all chops" toolbar button — the
+    // user wants to throw away the existing slice boundaries and
+    // start over, but keep the active region they're zoomed into.
+    void clearCuts();
+
+    // Clip locks: a per-clip-index boolean vector the same length
+    // as the chop list. Locks are positional — they refer to the
+    // output position of a clip in the current chop list, not to
+    // the clip's content. When the dice handler shuffles, locked
+    // clips keep their position and unlocked clips fill the gaps.
+    //
+    // The lock vector's size is kept in sync with the chop list:
+    // - cleared on a fresh file load (and after trim/shuffle, which
+    //   replace the buffer),
+    // - resized to N+1 whenever the chop list becomes N cuts,
+    // - default-constructed false otherwise.
+    //
+    // `getClipLocks` returns a copy of the current lock state so
+    // the host (e.g. shuffleChops) can read it; `setClipLocks`
+    // replaces the whole vector (used after shuffle to re-establish
+    // the same lock pattern at the new clip positions).
+    std::vector<bool> getClipLocks() const;
+    void setClipLocks(std::vector<bool> newLocks);
+    bool isClipLocked(int clipIndex) const;
+
     // Add a cut at `seconds`, clamped to (0, length). Inserted into
     // the sorted list; if a cut already exists within kMinChopGapSeconds
     // the call is a no-op (so a user clicking rapidly on the same spot
@@ -255,6 +282,16 @@ public:
     bool isInterestedInFileDrag(const juce::StringArray& files) override;
     void filesDropped(const juce::StringArray& files, int x, int y) override;
 
+    // Update startSeconds / endSeconds from a marker drag, with min-gap
+    // enforcement against the active region's other edge. Cut drags
+    // (DragTarget::Cut) clamp against both neighbours (the previous
+    // and next boundary in the full chop list — 0, startSeconds,
+    // other cuts, endSeconds, length). Public so tests can drive the
+    // chop-drag code paths directly (mouse events are awkward to
+    // synthesise in unit tests).
+    enum class DragTarget { None, Start, End, Pan, Cut };
+    void applyMarkerDrag(DragTarget target, int x, juce::Rectangle<int> bounds);
+
     // Mouse — chop-marker drag, pan, and double-click reset on Main only.
     void mouseMove(const juce::MouseEvent& e) override;
     void mouseDown(const juce::MouseEvent& e) override;
@@ -300,6 +337,16 @@ private:
     // playback slicing per the chops.
     std::vector<double> cuts;
 
+    // Per-clip-position lock flags, same length semantics as cuts +
+    // 1 (one flag per clip the cuts list defines). Indexed by clip
+    // position in the active region, not by clip content. The dice
+    // handler reads this via getClipLocks() to produce a constrained
+    // permutation; locks survive a shuffle because they're
+    // positional. Cleared on a fresh buffer (loadFile / trim /
+    // dice reload). Size kept in lockstep with cuts.size() in
+    // syncLockVectorSize().
+    std::vector<bool> clipLocks;
+
     // Selected clip [start, end], in seconds. start == end means
     // "no selection" (the view's initial state, before any file is
     // loaded). After a load, the only chop is [0, length], which is
@@ -316,7 +363,8 @@ private:
 
     // Active interaction (Main only). None means we're not dragging.
     // Cut carries the index into `cuts` of the boundary being dragged.
-    enum class DragTarget { None, Start, End, Pan, Cut };
+    // (DragTarget enum lives in the public section so tests can
+    // parameterise applyMarkerDrag directly.)
     DragTarget activeDrag = DragTarget::None;
     // Index into `cuts` for an in-progress Cut drag. Unused when
     // activeDrag != Cut. Indexes stay valid through the drag — if
@@ -416,6 +464,14 @@ private:
     // visible window.
     void drawSelectionHighlight(juce::Graphics& g, juce::Rectangle<int> bounds) const;
 
+    // Draws the per-clip lock icons at the top-right of each clip
+    // slice in the active region. White @ 50% alpha when unlocked,
+    // primary colour when locked. Skips clips narrower than the icon.
+    void drawClipLocks(juce::Graphics& g,
+                       juce::Rectangle<int> bounds,
+                       double visStart,
+                       double visEnd);
+
     // Draws the playhead if previewEngine != nullptr and isPlaying() is
     // true. 1 px vertical line in palette().playhead() colour.
     void drawPlayhead(juce::Graphics& g, juce::Rectangle<int> bounds);
@@ -448,12 +504,18 @@ private:
     DragTarget hitTestMarker(int x, juce::Rectangle<int> bounds,
                              int& outCutIndex) const;
 
+    // Returns the index of the clip whose lock icon (if any) is under
+    // the mouse position, or -1 if no lock icon is at that point.
+    // The hit zone matches the drawn icon's bounding rect plus a
+    // 2 px hit-target margin so the lock is easy to click.
+    int hitTestClipLock(int x, int y, juce::Rectangle<int> bounds) const;
+
     // Update startSeconds / endSeconds from a marker drag, with min-gap
     // enforcement against the active region's other edge. Cut drags
     // (DragTarget::Cut) clamp against both neighbours (the previous
     // and next boundary in the full chop list — 0, startSeconds,
-    // other cuts, endSeconds, length).
-    void applyMarkerDrag(DragTarget target, int x, juce::Rectangle<int> bounds);
+    // other cuts, endSeconds, length). Declared in the public
+    // section so tests can drive chop-drag directly.)
 
     // Apply a pan + vertical-drag zoom from a mouse drag. Horizontal motion
     // pans (anchor time stays under the press x). Vertical motion zooms:
@@ -473,6 +535,12 @@ private:
     // Called by both loadFile and reloadFromBuffer after they have
     // switched the AudioThumbnail's source.
     void resetForNewSource();
+
+    // Resize clipLocks so it has exactly cuts.size() + 1 entries
+    // (one flag per clip). New entries default to false (unlocked);
+    // trailing entries drop when the chop list shrinks. Called
+    // from every path that mutates cuts.
+    void syncLockVectorSize();
 };
 
 } // namespace spawn::ui
