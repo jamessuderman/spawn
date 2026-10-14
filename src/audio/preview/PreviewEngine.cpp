@@ -253,6 +253,92 @@ void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
     transport.store(idle, std::memory_order_release);
 }
 
+void PreviewEngine::setBufferFromChops(
+    std::vector<std::pair<double, double>> chops)
+{
+    const int64_t total = totalSourceSamples.load(std::memory_order_acquire);
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    if (total <= 0 || rate <= 0.0 || chops.empty())
+        return;
+
+    // Snapshot the current buffer. Same rationale as trimToRegion():
+    // we're on the message thread and only one of us reads.
+    const auto bufferSnapshot = loadBuffer();
+    if (bufferSnapshot == nullptr || bufferSnapshot->getNumSamples() == 0)
+        return;
+
+    const int numChannels = bufferSnapshot->getNumChannels();
+
+    // Resolve each chop window to [startSample, endSample) in source
+    // coordinates. Clamp to the loaded buffer's bounds so an
+    // out-of-range argument (e.g. user-typed marker past the end)
+    // cannot push us off the end of the source. After clamping,
+    // skip zero-length chops — a degenerate entry shouldn't grow
+    // the destination by zero samples (would be a silent gap that
+    // confuses downstream playhead math).
+    std::vector<std::pair<int64_t, int64_t>> resolved;
+    resolved.reserve(chops.size());
+    int64_t newLength = 0;
+    for (const auto& [startSec, endSec] : chops)
+    {
+        int64_t s = secondsToSourceSample(startSec, rate, total);
+        int64_t e = secondsToSourceSample(endSec,   rate, total);
+        if (e <= s)
+            continue;
+        // Clamp to the source bounds. secondsToSourceSample already
+        // clamps the seconds argument, but a caller might pass (1.0,
+        // 99.0) on a 0.5 s buffer — we've already rounded to sample
+        // indices, but we still need to ensure e <= total (the
+        // helper clamps each independently to [0, total] which can
+        // produce s == total if startSec > length).
+        if (s >= total)
+            continue;
+        if (e > total)
+            e = total;
+        resolved.emplace_back(s, e);
+        newLength += (e - s);
+    }
+
+    if (newLength <= 0)
+        return;
+
+    // Allocate the destination buffer and copy each chop across every
+    // channel. We trust the AudioBuffer's bounds — s and e were
+    // clamped to [0, total], and the source buffer's numSamples is
+    // `total`.
+    auto shuffled = std::make_shared<juce::AudioBuffer<float>>(
+        numChannels, static_cast<int>(newLength));
+
+    int64_t writeOffset = 0;
+    for (const auto& [s, e] : resolved)
+    {
+        const int chunkLen = static_cast<int>(e - s);
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            shuffled->copyFrom(ch, static_cast<int>(writeOffset),
+                               *bufferSnapshot,
+                               ch, static_cast<int>(s),
+                               chunkLen);
+        }
+        writeOffset += chunkLen;
+    }
+
+    // Publish the new buffer using the same swap pattern as
+    // setBuffer() / trimToRegion(). The old shared_ptr keeps the
+    // old buffer alive until the last in-flight audio render
+    // finishes on it.
+    storeBuffer(shuffled);
+    totalSourceSamples.store(newLength, std::memory_order_release);
+    sourceSampleRate.store(rate, std::memory_order_release);
+
+    // Reset transport to idle at the new buffer's start. Preserve
+    // the sticky loop toggle — same policy as trimToRegion.
+    TransportState idleState = transport.load(std::memory_order_relaxed);
+    idleState.playing   = false;
+    idleState.posSample = 0;
+    transport.store(idleState, std::memory_order_release);
+}
+
 bool PreviewEngine::writeBufferToWav(const juce::File& dest) const
 {
     const auto bufferSnapshot = loadBuffer();

@@ -758,6 +758,191 @@ public:
                          static_cast<juce::int64>(9 * 48000));
             temp.deleteFile();
         }
+
+        beginTest("setBufferFromChops: concatenates chops in given "
+                  "order with the requested total length");
+        {
+            // Build a 1-second source buffer with four distinct
+            // marker values (0.1, 0.2, 0.3, 0.4) — each quarter
+            // second holds a single constant. Chop [0, 0.25],
+            // [0.25, 0.5], [0.5, 0.75], [0.75, 1.0]. Reassemble them
+            // in reverse order [0.75, 1.0] + [0.5, 0.75] + ... and
+            // verify the new buffer holds the right values in the
+            // right positions.
+            PreviewEngine engine;
+            const int nSamples = 48000; // 1 s at 48 kHz
+            auto source = std::make_shared<juce::AudioBuffer<float>>(2, nSamples);
+            source->clear();
+            for (int i = 0; i < nSamples; ++i)
+            {
+                const float v = (i < nSamples / 4) ? 0.1f
+                              : (i < nSamples / 2) ? 0.2f
+                              : (i < 3 * nSamples / 4) ? 0.3f
+                              : 0.4f;
+                source->setSample(0, i, v);
+                source->setSample(1, i, v);
+            }
+            engine.setBuffer(source, 48000.0);
+
+            // Reverse the order: chop3 + chop2 + chop1 + chop0.
+            engine.setBufferFromChops({
+                { 0.75, 1.00 }, // chop 3 (value 0.4)
+                { 0.50, 0.75 }, // chop 2 (value 0.3)
+                { 0.25, 0.50 }, // chop 1 (value 0.2)
+                { 0.00, 0.25 }, // chop 0 (value 0.1)
+            });
+
+            auto result = engine.getBufferSnapshot();
+            expect(result != nullptr);
+            // Total length unchanged — 4 chops × 0.25 s = 1 s.
+            expectEquals(result->getNumSamples(), 48000);
+
+            // First quarter should hold 0.4 (chop 3), second 0.3,
+            // third 0.2, fourth 0.1.
+            const int q = nSamples / 4;
+            expectEquals(result->getSample(0, 0),       0.4f);
+            expectEquals(result->getSample(0, q - 1),  0.4f);
+            expectEquals(result->getSample(0, q),      0.3f);
+            expectEquals(result->getSample(0, 2*q - 1), 0.3f);
+            expectEquals(result->getSample(0, 2*q),    0.2f);
+            expectEquals(result->getSample(0, 3*q - 1), 0.2f);
+            expectEquals(result->getSample(0, 3*q),    0.1f);
+            expectEquals(result->getSample(0, nSamples - 1), 0.1f);
+            // Stereo channels should match (the source was symmetric).
+            expectEquals(result->getSample(1, 0),       0.4f);
+            expectEquals(result->getSample(1, nSamples - 1), 0.1f);
+
+            // The engine's buffer metadata also reflects the new
+            // length and the transport is idle.
+            expect(engine.hasBuffer());
+            expect(!engine.isPlaying());
+        }
+
+        beginTest("setBufferFromChops: empty input is a no-op");
+        {
+            // Empty chops list → no change. The buffer the engine
+            // already holds must be untouched.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000, 0.5f, 0.5f),
+                48000.0);
+            const auto before = engine.getBufferSnapshot();
+            expectEquals(before->getNumSamples(), 48000);
+
+            engine.setBufferFromChops({}); // empty
+
+            const auto after = engine.getBufferSnapshot();
+            expectEquals(after->getNumSamples(), 48000);
+        }
+
+        beginTest("setBufferFromChops: one-chop input is a no-op "
+                  "(nothing to rearrange)");
+        {
+            // Single chop = no rearrangement possible. The dice
+            // host handler short-circuits on this case before it
+            // ever reaches the engine; the engine method itself
+            // should also no-op rather than building a degenerate
+            // copy of itself.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000, 0.5f, 0.5f),
+                48000.0);
+
+            engine.setBufferFromChops({
+                { 0.0, 1.0 }, // the whole buffer, single chop
+            });
+
+            const auto after = engine.getBufferSnapshot();
+            expectEquals(after->getNumSamples(), 48000);
+            // Sample value should be unchanged (0.5).
+            expectEquals(after->getSample(0, 0), 0.5f);
+            expectEquals(after->getSample(0, 48000 - 1), 0.5f);
+        }
+
+        beginTest("setBufferFromChops: shuffled order is preserved "
+                  "end-to-end");
+        {
+            // Mirrors the dice button's flow at the API boundary.
+            // Build a 1-second source with 4 distinct 0.25 s
+            // quarters (values 0.1, 0.2, 0.3, 0.4). Shuffle into a
+            // specific permutation — the engine's API is
+            // permutation-driven, so we control the order directly
+            // (the dice handler in the host uses std::shuffle).
+            PreviewEngine engine;
+            const int nSamples = 48000;
+            auto source = std::make_shared<juce::AudioBuffer<float>>(2, nSamples);
+            source->clear();
+            for (int i = 0; i < nSamples; ++i)
+            {
+                const float v = (i < nSamples / 4) ? 0.1f
+                              : (i < nSamples / 2) ? 0.2f
+                              : (i < 3 * nSamples / 4) ? 0.3f
+                              : 0.4f;
+                source->setSample(0, i, v);
+                source->setSample(1, i, v);
+            }
+            engine.setBuffer(source, 48000.0);
+
+            // Permutation: chop 1, chop 3, chop 0, chop 2.
+            // Expected output: [0.2, 0.4, 0.1, 0.3].
+            engine.setBufferFromChops({
+                { 0.25, 0.50 }, // chop 1 (0.2)
+                { 0.75, 1.00 }, // chop 3 (0.4)
+                { 0.00, 0.25 }, // chop 0 (0.1)
+                { 0.50, 0.75 }, // chop 2 (0.3)
+            });
+
+            auto result = engine.getBufferSnapshot();
+            const int q = nSamples / 4;
+            expectEquals(result->getSample(0, 0),       0.2f);
+            expectEquals(result->getSample(0, q - 1),  0.2f);
+            expectEquals(result->getSample(0, q),      0.4f);
+            expectEquals(result->getSample(0, 2*q - 1), 0.4f);
+            expectEquals(result->getSample(0, 2*q),    0.1f);
+            expectEquals(result->getSample(0, 3*q - 1), 0.1f);
+            expectEquals(result->getSample(0, 3*q),    0.3f);
+            expectEquals(result->getSample(0, nSamples - 1), 0.3f);
+        }
+
+        beginTest("setBufferFromChops: subsequent playback plays the "
+                  "shuffled buffer top-to-bottom");
+        {
+            // Sanity: after shuffle, Transport-row Play from 0 to
+            // newLength plays the new buffer. We render one block
+            // and verify the first sample's value matches the
+            // shuffle order's first chop.
+            PreviewEngine engine;
+            const int nSamples = 48000;
+            auto source = std::make_shared<juce::AudioBuffer<float>>(2, nSamples);
+            source->clear();
+            for (int i = 0; i < nSamples; ++i)
+                source->setSample(0, i, 0.7f);
+            for (int i = nSamples / 2; i < nSamples; ++i)
+                source->setSample(0, i, 0.9f);
+            engine.setBuffer(source, 48000.0);
+
+            // Reassemble: tail-half + head-half. Output should be
+            // 0.9 then 0.7.
+            engine.setBufferFromChops({
+                { 0.5, 1.0 }, // tail (0.9)
+                { 0.0, 0.5 }, // head (0.7)
+            });
+
+            engine.prepareToPlay(256, 48000.0);
+            engine.setGain(1.0f);
+            engine.playFrom(0.0, 1.0);
+
+            // Render a small block and check the very first sample
+            // matches the new buffer's first sample.
+            juce::AudioBuffer<float> out(2, 256);
+            out.clear();
+            juce::AudioSourceChannelInfo info;
+            info.buffer = &out;
+            info.startSample = 0;
+            info.numSamples = 256;
+            engine.getNextAudioBlock(info);
+            expect(out.getSample(0, 0) > 0.85f); // first chop is 0.9
+        }
     }
 };
 

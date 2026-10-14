@@ -5,6 +5,11 @@
 
 #include <JuceHeader.h>
 
+#include <algorithm>
+#include <random>
+#include <utility>
+#include <vector>
+
 #include "audio/preview/AudioDeviceHolder.h"
 #include "audio/preview/PreviewEngine.h"
 #include "audio/preview/SampleDecoder.h"
@@ -454,15 +459,17 @@ namespace
                         spawn::ui::Icons::Id::Scissors,
                         [this](spawn::ui::ToolHandle h) { onWaveformToolPicked(h); });
                     // Right-side actions: Open is the primary slot (rightmost),
-                    // then Reset-Zoom, then Crop/Trim. All three are
-                    // one-shot; none latches, none clears the tool group's
-                    // active state.
+                    // then Reset-Zoom, then Crop/Trim, then Shuffle.
+                    // All four are one-shot; none latches, none clears
+                    // the tool group's active state.
                     toolbar->setAction(spawn::ui::Icons::Id::FolderOpen,
                                        [this] { openAudioFile(); });
                     toolbar->addAction(spawn::ui::Icons::Id::Scan,
                                        [this] { resetWaveformZoom(); });
                     toolbar->addAction(spawn::ui::Icons::Id::Crop,
                                        [this] { trimOutsideMarkers(); });
+                    toolbar->addAction(spawn::ui::Icons::Id::Dice5,
+                                       [this] { shuffleChops(); });
 
                     speakerToolIndex = speaker.index();
                     scissorsToolIndex = scissors.index();
@@ -655,6 +662,135 @@ namespace
                         clamped.push_back(rel);
                     }
                     waveformView->setCuts(std::move(clamped));
+                }
+
+                // Shuffle the chops in the active region into a new random order
+                // and replace the engine + view with the shuffled
+                // concatenation. Pressing Play after a shuffle plays
+                // the new ordering top-to-bottom — the dice builds the
+                // rearrangement, the Transport Play button plays it.
+                //
+                // The active region [startSeconds, endSeconds] defines
+                // the shuffle domain; cuts inside it are permuted, cuts
+                // outside it are left untouched (they don't exist today
+                // since cuts are clamped within the active region, but
+                // the policy keeps the door open). The chopped clips
+                // are concatenated in the random order into a single
+                // new buffer that becomes the engine's new playback
+                // source and the view's new waveform.
+                //
+                // One-shot action wired to the toolbar's dice-5 icon.
+                // No-op when no buffer is loaded, when there's only
+                // one chop (a single chop can't be shuffled), or when
+                // the active region is empty.
+                void shuffleChops()
+                {
+                    if (waveformView == nullptr)
+                        return;
+                    if (!engine.hasBuffer())
+                        return;
+
+                    const double regionStart = waveformView->getStartSeconds();
+                    const double regionEnd   = waveformView->getEndSeconds();
+                    if (regionEnd <= regionStart)
+                        return;
+
+                    // Snapshot the view's cut list. Cuts live in seconds
+                    // on the view's time axis; the active region's
+                    // boundaries aren't part of cuts (they're separate
+                    // members), so the chop list we're shuffling is
+                    // [regionStart, regionEnd] partitioned by cuts that
+                    // lie inside the region.
+                    std::vector<double> allCuts = waveformView->getCuts();
+                    std::vector<double> innerCuts;
+                    innerCuts.reserve(allCuts.size());
+                    for (const double c : allCuts)
+                    {
+                        // Only consider cuts strictly inside the active
+                        // region. Cuts exactly on a boundary are
+                        // unreachable in practice (addCut clamps to
+                        // (0, length) and the view's gap enforcement
+                        // keeps them off the markers) but defensively
+                        // filter them too.
+                        if (c > regionStart && c < regionEnd)
+                            innerCuts.push_back(c);
+                    }
+
+                    // The shuffle domain has (N+1) chops where N is
+                    // innerCuts.size(). With N == 0 there's only one
+                    // chop — nothing to do. With N >= 1 we have a
+                    // multi-chop buffer that can be shuffled.
+                    if (innerCuts.size() < 1)
+                        return;
+
+                    // Build the original-order list of chop windows in
+                    // seconds. Each window is [start, end] where the
+                    // next window's start equals this window's end (the
+                    // cuts are the boundaries between consecutive
+                    // chops).
+                    std::vector<std::pair<double, double>> originalOrder;
+                    originalOrder.reserve(innerCuts.size() + 1);
+                    double cursorSec = regionStart;
+                    for (const double c : innerCuts)
+                    {
+                        originalOrder.emplace_back(cursorSec, c);
+                        cursorSec = c;
+                    }
+                    originalOrder.emplace_back(cursorSec, regionEnd);
+
+                    // Permute the indices and apply the same order to
+                    // (a) the chop windows we hand to the engine and
+                    // (b) the cut list we restore into the view. The
+                    // cuts in the view become the *positions* of the
+                    // internal chop boundaries in the new buffer — for
+                    // each chop in the shuffled order, its right
+                    // boundary (or left for the final chop) lands at
+                    // a specific second in the new buffer.
+                    std::vector<int> perm(originalOrder.size());
+                    for (size_t i = 0; i < perm.size(); ++i)
+                        perm[i] = static_cast<int>(i);
+                    std::random_device rd;
+                    std::mt19937 rng(rd());
+                    std::shuffle(perm.begin(), perm.end(), rng);
+
+                    std::vector<std::pair<double, double>> shuffledWindows;
+                    shuffledWindows.reserve(perm.size());
+                    for (const int idx : perm)
+                        shuffledWindows.push_back(originalOrder[idx]);
+
+                    // Build the new cuts list for the view. The new
+                    // buffer's length is sum(window sizes) — same as
+                    // (regionEnd - regionStart) — so we can compute
+                    // each new cut position by summing the lengths of
+                    // preceding chops in the shuffled order.
+                    std::vector<double> newCuts;
+                    newCuts.reserve(perm.size() - 1);
+                    double accum = 0.0;
+                    for (size_t i = 0; i + 1 < shuffledWindows.size(); ++i)
+                    {
+                        accum += (shuffledWindows[i].second
+                                  - shuffledWindows[i].first);
+                        newCuts.push_back(accum);
+                    }
+
+                    // Hand the windows to the engine. setBufferFromChops
+                    // builds the concatenated buffer, swaps it in, and
+                    // resets transport.
+                    engine.setBufferFromChops(shuffledWindows);
+
+                    // Reload the view with the new buffer via the
+                    // in-memory path (no temp WAV, no cache hazard).
+                    auto shuffledBuffer = engine.getBufferSnapshot();
+                    if (shuffledBuffer == nullptr
+                        || shuffledBuffer->getNumSamples() == 0)
+                        return;
+                    waveformView->reloadFromBuffer(
+                        shuffledBuffer, engine.getSourceSampleRate());
+
+                    // Push the new cut positions. reloadFromBuffer
+                    // cleared the cuts; setCuts restores them at the
+                    // boundaries of the shuffled concatenation.
+                    waveformView->setCuts(std::move(newCuts));
                 }
 
                 // Called from the WaveformView's OnFileLoaded hook (which

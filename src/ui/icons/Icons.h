@@ -31,6 +31,7 @@ public:
         Pause,
         Square,
         Repeat2,
+        Dice5,
     };
 
     // Parse and cache the icon at the requested pixel size.

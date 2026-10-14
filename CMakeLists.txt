@@ -54,6 +54,7 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/pause.svg
             resources/icons/lucide/square.svg
             resources/icons/lucide/repeat-2.svg
+            resources/icons/lucide/dice-5.svg
             resources/assets/Knob.svg
             resources/assets/Button.svg
             resources/licences/LICENCE-PublicSans.md

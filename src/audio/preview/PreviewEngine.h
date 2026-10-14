@@ -119,6 +119,24 @@ public:
     // Synchronous; intended for the message thread (UI button).
     void trimToRegion(double startSeconds, double endSeconds);
 
+    // Build a new buffer by concatenating `chops` — a list of
+    // [startSeconds, endSeconds] windows into the *current* engine
+    // buffer — in the order given. Each window's samples are copied
+    // across every channel into the destination buffer, in order.
+    // Used by the shuffle feature: the host hands a permutation of
+    // the existing chop windows and the engine emits a buffer whose
+    // play-time order is the permutation.
+    //
+    // The new buffer's length is the sum of (endSample - startSample)
+    // across all chops. If the result would be empty (empty `chops`,
+    // every window zero-length, or no buffer loaded), the call is a
+    // no-op. Out-of-range windows are clamped to the loaded buffer's
+    // extent, matching playFrom() / trimToRegion(). Stops playback
+    // and resets transport to idle.
+    //
+    // Synchronous; intended for the message thread (UI button).
+    void setBufferFromChops(std::vector<std::pair<double, double>> chops);
+
     // Write the engine's current buffer out to a WAV file at the
     // given path. Used by the host to materialise a trimmed buffer
     // so the WaveformView's AudioThumbnail can reload it without
