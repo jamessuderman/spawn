@@ -397,6 +397,367 @@ public:
             }
             temp.deleteFile();
         }
+
+        beginTest("pause silences output and preserves the playhead");
+        {
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.6f, 0.6f), 48000.0);
+            engine.setGain(1.0f);
+            engine.playFrom(0.0, 1.0);
+
+            // Render one block to advance posSample into the buffer.
+            (void) renderMaxAbs(engine, 256);
+            const double pausedAt = engine.getCurrentPositionSeconds();
+            expect(pausedAt > 0.0);
+
+            engine.pause();
+            expect(!engine.isPlaying());
+            expectEquals(engine.getCurrentPositionSeconds(), pausedAt);
+            expectEquals(renderMaxAbs(engine, 256), 0.0f);
+        }
+
+        beginTest("setPlayheadSeconds parks without starting playback");
+        {
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.5f, 0.5f), 48000.0);
+
+            engine.setPlayheadSeconds(0.5);
+            expect(!engine.isPlaying());
+            expectEquals(engine.getCurrentPositionSeconds(), 0.5);
+
+            // Out-of-range values clamp to the buffer extent, not to 0.
+            engine.setPlayheadSeconds(99.0);
+            expectEquals(engine.getCurrentPositionSeconds(),
+                         48000.0 / 48000.0);
+
+            // setPlayheadSeconds on an engine already playing stops it
+            // without resuming — same behaviour as setBuffer's reset.
+            engine.playFrom(0.0, 1.0);
+            expect(engine.isPlaying());
+            engine.setPlayheadSeconds(0.25);
+            expect(!engine.isPlaying());
+            expectEquals(engine.getCurrentPositionSeconds(), 0.25);
+        }
+
+        beginTest("setPlayheadSeconds on an empty engine is a no-op");
+        {
+            PreviewEngine engine;
+            engine.setPlayheadSeconds(0.5);
+            // No crash, no exception, no position change.
+            expectEquals(engine.getCurrentPositionSeconds(), 0.0);
+            expect(!engine.isPlaying());
+        }
+
+        beginTest("loop off: end-of-window self-stops as before");
+        {
+            // Regression guard for the historical one-shot behaviour:
+            // the loop flag is opt-in.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(256, 0.8f, 0.8f), 48000.0);
+            engine.setGain(1.0f);
+
+            expect(!engine.isLoopEnabled());
+            engine.playFrom(0.0, 256.0 / 48000.0);
+            (void) renderMaxAbs(engine, 256);
+            expect(!engine.isPlaying());
+        }
+
+        beginTest("loop on: end-of-window rewinds and keeps playing");
+        {
+            // Loop flag set, short buffer: the first block fills the
+            // window, the engine rewinds to startSample, and the next
+            // block still produces non-silence.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(256, 0.8f, 0.8f), 48000.0);
+            engine.setGain(1.0f);
+            engine.setLoopEnabled(true);
+            expect(engine.isLoopEnabled());
+
+            engine.playFrom(0.0, 256.0 / 48000.0);
+            expect(engine.isPlaying());
+
+            // Render a block. Whether this block ends exactly on the
+            // window edge or runs past it, the engine should still be
+            // playing afterwards (looped).
+            const float first = renderMaxAbs(engine, 256);
+            expect(first > 0.0f);
+            expect(engine.isPlaying());
+
+            // Next block must also be non-silent — the playhead has
+            // been rewound and we're rendering from the start of the
+            // loop window.
+            const float second = renderMaxAbs(engine, 256);
+            expect(second > 0.0f);
+            expect(engine.isPlaying());
+        }
+
+        beginTest("loop: the published playhead wraps back to startSample");
+        {
+            // After the first loop wrap, getCurrentPositionSeconds()
+            // should sit at or just past startSample (the rewound
+            // position), confirming the audio thread published the
+            // new posSample through the same atomic as the play
+            // window.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(256, 0.5f, 0.5f), 48000.0);
+            engine.setLoopEnabled(true);
+
+            engine.playFrom(0.0, 256.0 / 48000.0);
+            // First block: likely consumes the whole window and rewinds.
+            (void) renderMaxAbs(engine, 256);
+            const double wrapped = engine.getCurrentPositionSeconds();
+            // Should be near the start of the window (well under
+            // end-of-window 5.3 ms).
+            expect(wrapped < (256.0 / 48000.0));
+            expect(wrapped >= 0.0);
+            expect(engine.isPlaying());
+        }
+
+        beginTest("setLoopEnabled preserves across stop");
+        {
+            // Loop is sticky across stop: setting it on, calling stop,
+            // and then querying should still report the flag on.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.5f, 0.5f), 48000.0);
+            engine.setGain(1.0f);
+
+            engine.setLoopEnabled(true);
+            engine.playFrom(0.0, 1.0);
+            engine.stop();
+            expect(engine.isLoopEnabled());
+            expectEquals(engine.getCurrentPositionSeconds(), 0.0);
+        }
+
+        beginTest("setLoopEnabled preserves across pause");
+        {
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.5f, 0.5f), 48000.0);
+
+            engine.setLoopEnabled(true);
+            engine.playFrom(0.0, 1.0);
+            (void) renderMaxAbs(engine, 256);
+            engine.pause();
+            expect(engine.isLoopEnabled());
+            expect(!engine.isPlaying());
+        }
+
+        beginTest("natural end-of-region parks the playhead at startSample");
+        {
+            // After a non-looped play runs to its end, the engine
+            // self-stops and parks posSample at startSample so the
+            // next playFrom() — which the Transport uses as its
+            // resume anchor — replays from the start of the window
+            // rather than from endSample (which would produce
+            // immediate silence on the next block).
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(256, 0.8f, 0.8f), 48000.0);
+            engine.setGain(1.0f);
+
+            engine.playFrom(0.0, 256.0 / 48000.0);
+            expect(engine.isPlaying());
+            // Render one block — the engine consumes the whole
+            // window and self-stops.
+            (void) renderMaxAbs(engine, 256);
+            expect(!engine.isPlaying());
+            expectEquals(engine.getCurrentPositionSeconds(), 0.0);
+
+            // Pressing play again must replay from the beginning,
+            // not from endSample. We assert by reading the first
+            // block's first sample — it must be the buffer's
+            // non-zero value (0.8), not silence.
+            engine.playFrom(engine.getCurrentPositionSeconds(),
+                            256.0 / 48000.0);
+            expect(engine.isPlaying());
+            const auto out = renderLeftChannel(engine, 256);
+            expectEquals(out.front(), 0.8f);
+        }
+
+        beginTest("natural end-of-region with non-zero startSample also rewinds");
+        {
+            // Same rule with a window that doesn't start at 0:
+            // self-stop parks at startSample (not endSample, not 0).
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.5f, 0.5f), 48000.0);
+            engine.setGain(1.0f);
+
+            // Window is [0.5, 1.0).
+            engine.playFrom(0.5, 1.0);
+            // Drain a few blocks. We don't know exactly how many
+            // blocks it'll take to hit endSample at this rate, so
+            // just render until isPlaying() goes false.
+            while (engine.isPlaying())
+                (void) renderMaxAbs(engine, 256);
+            expectEquals(engine.getCurrentPositionSeconds(), 0.5);
+        }
+
+        beginTest("pause then play resumes from the pause point");
+        {
+            // The Transport Play handler reads getCurrentPositionSeconds
+            // as its resume anchor, so pause-then-play must pick up
+            // exactly where pause left off.
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.6f, 0.6f), 48000.0);
+            engine.setGain(1.0f);
+
+            engine.playFrom(0.0, 1.0);
+            (void) renderMaxAbs(engine, 256);
+            engine.pause();
+            const double pausedAt = engine.getCurrentPositionSeconds();
+            expect(pausedAt > 0.0);
+
+            engine.playFrom(engine.getCurrentPositionSeconds(), 1.0);
+            expect(engine.isPlaying());
+            const double afterResume = engine.getCurrentPositionSeconds();
+            expect(afterResume >= pausedAt - 1e-6);
+        }
+
+        beginTest("stop then play starts from the start marker");
+        {
+            // Stop parks posSample at startSeconds, so the next
+            // playFrom() (which uses posSample as its resume
+            // anchor) replays from the start marker. With the
+            // default window (startSeconds == 0), this collapses
+            // to "from the beginning".
+            PreviewEngine engine;
+            engine.prepareToPlay(256, 48000.0);
+            engine.setBuffer(makeStereoConstantBuffer(48000, 0.5f, 0.5f), 48000.0);
+
+            engine.playFrom(0.25, 0.75);
+            (void) renderMaxAbs(engine, 256);
+            engine.stop();
+            engine.setPlayheadSeconds(0.25); // mimic the Transport Stop handler
+            expectEquals(engine.getCurrentPositionSeconds(), 0.25);
+
+            engine.playFrom(engine.getCurrentPositionSeconds(), 1.0);
+            // The first device sample maps to source sample 0.25 s,
+            // so getCurrentPositionSeconds should be at 0.25 (plus
+            // a fraction due to the resample).
+            expect(engine.isPlaying());
+            expect(engine.getCurrentPositionSeconds() >= 0.25 - 1e-6);
+        }
+
+        beginTest("trim + writeBufferToWav: a wide marker region "
+                  "produces a wide WAV");
+        {
+            // Reproduction for the user-reported bug: "very long area
+            // inside the start and end trimmed to a very short audio."
+            // We construct a buffer, trim to [0.25, 0.75], write the
+            // result to a temp WAV, and verify the WAV's actual
+            // length matches the trim range. If trimToRegion or
+            // writeBufferToWav uses stale state, the WAV would be
+            // shorter than expected.
+            PreviewEngine engine;
+            const int nSamples = 48000; // 1 second at 48 kHz
+            engine.setBuffer(
+                makeStereoConstantBuffer(nSamples, 0.5f, 0.5f), 48000.0);
+
+            // Wide trim — exactly half the buffer.
+            engine.trimToRegion(0.25, 0.75);
+
+            const auto temp = juce::File::getSpecialLocation(
+                juce::File::tempDirectory)
+                .getChildFile("spawn-trim-bugrepro.wav");
+            expect(engine.writeBufferToWav(temp));
+            expect(temp.existsAsFile());
+
+            juce::AudioFormatManager mgr;
+            mgr.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader(
+                mgr.createReaderFor(temp));
+            expect(reader != nullptr);
+            if (reader != nullptr)
+            {
+                // 0.5 seconds at 48 kHz = 24000 samples. Anything
+                // noticeably less than this points to trimToRegion or
+                // writeBufferToWav using stale length / marker state.
+                expectEquals(reader->lengthInSamples,
+                             static_cast<juce::int64>(24000));
+                expectEquals(reader->sampleRate, 48000.0);
+            }
+            temp.deleteFile();
+        }
+
+        beginTest("trim + writeBufferToWav: chained trims produce "
+                  "chained-sized WAVs");
+        {
+            // User-reported variant: trims stack up. Each trim's
+            // marker positions refer to the *current* (already
+            // trimmed) buffer, not the original. If trimToRegion
+            // reads length from a stale source the second trim would
+            // either be clamped or produce a buffer whose length
+            // doesn't match the marker positions.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(96000, 0.5f, 0.5f), 48000.0); // 2 s
+
+            // First trim: [0.5, 1.5] → 1 s buffer.
+            engine.trimToRegion(0.5, 1.5);
+            const auto temp1 = juce::File::getSpecialLocation(
+                juce::File::tempDirectory)
+                .getChildFile("spawn-trim-bugrepro-1.wav");
+            engine.writeBufferToWav(temp1);
+            juce::AudioFormatManager mgr;
+            mgr.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> r1(
+                mgr.createReaderFor(temp1));
+            expect(r1 != nullptr);
+            expectEquals(r1->lengthInSamples,
+                         static_cast<juce::int64>(48000)); // 1 s
+            temp1.deleteFile();
+
+            // Second trim on the trimmed buffer: [0.25, 0.75] of the
+            // new 1-second buffer → 0.5 s buffer.
+            engine.trimToRegion(0.25, 0.75);
+            const auto temp2 = juce::File::getSpecialLocation(
+                juce::File::tempDirectory)
+                .getChildFile("spawn-trim-bugrepro-2.wav");
+            engine.writeBufferToWav(temp2);
+            std::unique_ptr<juce::AudioFormatReader> r2(
+                mgr.createReaderFor(temp2));
+            expect(r2 != nullptr);
+            expectEquals(r2->lengthInSamples,
+                         static_cast<juce::int64>(24000)); // 0.5 s
+            temp2.deleteFile();
+        }
+
+        beginTest("trim + writeBufferToWav: trim near the buffer's "
+                  "edges uses the requested width, not a cached one");
+        {
+            // User-described symptom: "very long area inside the start
+            // and end... trimmed to a very short audio." Cover the
+            // edge cases — trim starting at 0, trim ending at the
+            // total, and a wide trim spanning almost the whole buffer.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000 * 10, 0.5f, 0.5f), 48000.0); // 10 s
+
+            // Wide trim covering 9 of 10 seconds.
+            engine.trimToRegion(0.5, 9.5);
+            const auto temp = juce::File::getSpecialLocation(
+                juce::File::tempDirectory)
+                .getChildFile("spawn-trim-wide.wav");
+            engine.writeBufferToWav(temp);
+
+            juce::AudioFormatManager mgr;
+            mgr.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader(
+                mgr.createReaderFor(temp));
+            expect(reader != nullptr);
+            // 9 seconds * 48000 = 432000 samples.
+            expectEquals(reader->lengthInSamples,
+                         static_cast<juce::int64>(9 * 48000));
+            temp.deleteFile();
+        }
     }
 };
 

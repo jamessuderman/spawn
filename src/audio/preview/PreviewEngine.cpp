@@ -62,8 +62,9 @@ void PreviewEngine::setBuffer(
 
     // A new buffer invalidates the in-flight transport. Reset to idle
     // and park the playhead at 0 so a stale "playing" state from the
-    // previous file doesn't leak into the new one.
-    TransportState idle{};
+    // previous file doesn't leak into the new one. Preserve the
+    // sticky loop toggle across the buffer swap.
+    TransportState idle = transport.load(std::memory_order_relaxed);
     idle.playing = false;
     idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
@@ -93,7 +94,7 @@ void PreviewEngine::playFrom(double startSeconds, double endSeconds)
             s = juce::jmax<int64_t>(0, e - 1);
     }
 
-    TransportState next{};
+    TransportState next = transport.load(std::memory_order_relaxed);
     next.playing     = true;
     next.startSample = s;
     next.endSample   = e;
@@ -101,12 +102,98 @@ void PreviewEngine::playFrom(double startSeconds, double endSeconds)
     transport.store(next, std::memory_order_release);
 }
 
+void PreviewEngine::setPlayWindow(double startSeconds, double endSeconds)
+{
+    // Live-update the play window without restarting. Used while the
+    // engine is playing (typically looping) so a mid-loop drag of the
+    // start/end markers takes effect on the next loop iteration.
+    // posSample and the playing flag are preserved — only the window
+    // boundaries move.
+    const int64_t total = totalSourceSamples.load(std::memory_order_acquire);
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    if (total <= 0 || rate <= 0.0)
+        return;
+
+    int64_t s = secondsToSourceSample(startSeconds, rate, total);
+    int64_t e = secondsToSourceSample(endSeconds,   rate, total);
+
+    // Same strictly-positive guard as playFrom(). An inverted or
+    // zero-length window would lock the audio thread into either a
+    // silent immediate-stop or a continuous-rewind spin.
+    if (e <= s)
+    {
+        if (e < total)
+            e = s + 1;
+        else
+            s = juce::jmax<int64_t>(0, e - 1);
+    }
+
+    TransportState next = transport.load(std::memory_order_relaxed);
+    next.startSample = s;
+    next.endSample   = e;
+    // posSample and playing intentionally untouched.
+    transport.store(next, std::memory_order_release);
+}
+
 void PreviewEngine::stop()
 {
-    TransportState idle{};
+    // Preserve the loop toggle so a Stop doesn't silently disable loop;
+    // the user has to hit the Loop button off to turn looping off.
+    TransportState idle = transport.load(std::memory_order_relaxed);
     idle.playing   = false;
     idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
+}
+
+void PreviewEngine::pause()
+{
+    // Stop the audio but keep posSample at its current value. Reading
+    // and writing through the same atomic as the play window keeps the
+    // UI thread's subsequent playFrom() race-free with this publish.
+    TransportState idle = transport.load(std::memory_order_relaxed);
+    idle.playing = false;
+    // idle.posSample unchanged — that's the whole point of pause vs stop.
+    transport.store(idle, std::memory_order_release);
+}
+
+void PreviewEngine::setLoopEnabled(bool enabled) noexcept
+{
+    TransportState s = transport.load(std::memory_order_relaxed);
+    s.loopEnabled = enabled;
+    transport.store(s, std::memory_order_release);
+}
+
+bool PreviewEngine::isLoopEnabled() const noexcept
+{
+    return transport.load(std::memory_order_acquire).loopEnabled;
+}
+
+double PreviewEngine::getPlayheadSeconds() const noexcept
+{
+    // Same as getCurrentPositionSeconds() but the name signals that
+    // the value reflects the playback position even when the engine
+    // is paused/stopped. After pause() this is where we left off;
+    // after stop() this is 0.
+    return getCurrentPositionSeconds();
+}
+
+void PreviewEngine::setPlayheadSeconds(double seconds) noexcept
+{
+    const int64_t total = totalSourceSamples.load(std::memory_order_acquire);
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    if (total <= 0 || rate <= 0.0)
+        return;
+
+    // Clamp to [0, total] so a stray Transport Stop after the user has
+    // dragged past the buffer end never publishes a phantom sample.
+    int64_t s = static_cast<int64_t>(
+        std::llround(seconds * rate));
+    s = juce::jlimit<int64_t>(0, total, s);
+
+    TransportState next = transport.load(std::memory_order_relaxed);
+    next.playing   = false;  // explicit: parking the playhead never resumes playback
+    next.posSample = s;
+    transport.store(next, std::memory_order_release);
 }
 
 void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
@@ -157,8 +244,10 @@ void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
     totalSourceSamples.store(newLength, std::memory_order_release);
     sourceSampleRate.store(rate, std::memory_order_release);
 
-    // Reset transport to idle at the new buffer's start.
-    TransportState idle{};
+    // Reset transport to idle at the new buffer's start. Preserve the
+    // sticky loop toggle across the trim — the user's loop preference
+    // is independent of which buffer is loaded.
+    TransportState idle = transport.load(std::memory_order_relaxed);
     idle.playing   = false;
     idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
@@ -222,6 +311,24 @@ double PreviewEngine::getCurrentPositionSeconds() const noexcept
 bool PreviewEngine::hasBuffer() const noexcept
 {
     return totalSourceSamples.load(std::memory_order_acquire) > 0;
+}
+
+std::shared_ptr<const juce::AudioBuffer<float>>
+PreviewEngine::getBufferSnapshot() const
+{
+    // Public accessor over loadBuffer() so the trim path can hand the
+    // current buffer straight to the WaveformView without going
+    // through disk or a temp WAV. Returns the same shared_ptr the
+    // audio thread reads from, so the caller must keep the returned
+    // shared_ptr alive for as long as the buffer needs to remain
+    // valid — the AudioThumbnail holds a non-owning pointer that
+    // would dangle if we let this shared_ptr go out of scope.
+    return loadBuffer();
+}
+
+double PreviewEngine::getSourceSampleRate() const noexcept
+{
+    return sourceSampleRate.load(std::memory_order_acquire);
 }
 
 void PreviewEngine::prepareToPlay(int samplesPerBlockExpected,
@@ -293,15 +400,44 @@ void PreviewEngine::getNextAudioBlock(
         std::llround(static_cast<double>(numSamples) * (srcRate / devRate)));
     const int64_t blockSourceSamples = juce::jmax<int64_t>(1, deviceToSourceScaleNum);
 
+    // Re-read the live play window (start/end) on every entry to
+    // getNextAudioBlock so mid-playback drags of the markers take
+    // effect on the next iteration. posSample stays anchored to the
+    // snapshot `t` because that's the playhead this block is rendering
+    // from; the window is just the bounds we're allowed to play within.
+    // The UI thread's setPlayWindow() publishes to the same atomic so
+    // the next acquire-load here picks up the new window.
+    int64_t liveStart = t.startSample;
+    int64_t liveEnd   = t.endSample;
+
     // If the playhead has already reached end, stop and bail. We do
-    // not want to play past the end even briefly.
-    if (posSource >= t.endSample)
+    // not want to play past the end even briefly — unless loop is
+    // enabled, in which case we rewind to liveStart and render this
+    // block from the loop's top. The rewind is in-place: posSource
+    // becomes liveStart and the for-loop below continues reading
+    // from there.
+    if (posSource >= liveEnd)
     {
-        TransportState idle{};
-        idle.playing   = false;
-        idle.posSample = t.endSample;
-        transport.store(idle, std::memory_order_release);
-        return;
+        if (t.loopEnabled && liveEnd > liveStart)
+        {
+            // Rewind in place; the audio thread will publish the
+            // rewound posSample at the end of this block.
+            posSource = liveStart;
+        }
+        else
+        {
+            // Natural end-of-region: park the playhead at liveStart
+            // rather than liveEnd so the next playFrom() from the
+            // UI thread (which reads posSample as its resume point)
+            // replays from the start of the window. liveEnd would
+            // leave the next Play silent (we'd immediately hit the end
+            // again on the first block).
+            TransportState idle = transport.load(std::memory_order_relaxed);
+            idle.playing   = false;
+            idle.posSample = liveStart;
+            transport.store(idle, std::memory_order_release);
+            return;
+        }
     }
 
     const float g = gain.load(std::memory_order_relaxed);
@@ -317,17 +453,54 @@ void PreviewEngine::getNextAudioBlock(
 
     for (int i = 0; i < numSamples; ++i)
     {
+        // Re-read the play window every iteration so a marker drag
+        // mid-loop takes effect on the very next sample after the
+        // publish — within the same block if the drag arrives during
+        // playback, definitely by the next block boundary.
+        const TransportState liveT = transport.load(std::memory_order_acquire);
+        liveStart = liveT.startSample;
+        liveEnd   = liveT.endSample;
+
         // Nearest source sample for this device sample.
         const int64_t srcIdx = posSource
             + static_cast<int64_t>(std::llround(static_cast<double>(i) / ratio));
-        if (srcIdx >= t.endSample || srcIdx >= total)
+        if (srcIdx >= liveEnd || srcIdx >= total)
         {
+            if (liveT.loopEnabled && liveEnd > liveStart)
+            {
+                // Loop: rewind to liveStart and continue rendering
+                // this block from the top of the loop window. The
+                // remaining samples in the block will read from the
+                // beginning of the loop, giving us the seamless
+                // wrap-around at the loop point (modulo nearest-
+                // neighbour resampling artefacts, which the preview
+                // voice already accepts).
+                posSource = liveStart;
+                // Recompute srcIdx for this device sample position
+                // from the rewound posSource so this very output
+                // sample i also comes from the loop top.
+                const int64_t rewindIdx = posSource
+                    + static_cast<int64_t>(std::llround(static_cast<double>(i) / ratio));
+                for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
+                {
+                    const int srcCh = juce::jmin(ch, numChannels - 1);
+                    const float* src = bufferSnapshot->getReadPointer(srcCh);
+                    float* dst = info.buffer->getWritePointer(ch, writeStart);
+                    dst[i] = src[rewindIdx] * g;
+                }
+                continue;
+            }
+
             // Reached the end of the play window or the buffer.
-            // Publish where we stopped so the UI can show the final
-            // playhead position.
-            TransportState idle{};
+            // Publish the natural-end stop so the UI can read the
+            // final playhead position. Park posSample at liveStart
+            // (not liveEnd) so a subsequent playFrom() — which uses
+            // posSample as its resume anchor — replays from the
+            // beginning of the window rather than landing on the end
+            // and producing silence.
+            TransportState idle = transport.load(std::memory_order_relaxed);
             idle.playing   = false;
-            idle.posSample = juce::jmin(srcIdx, t.endSample);
+            idle.posSample = liveStart;
             transport.store(idle, std::memory_order_release);
             // Zero the rest of the buffer (already cleared at the top).
             for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
@@ -349,11 +522,14 @@ void PreviewEngine::getNextAudioBlock(
     }
 
     // Advance the playhead by however many source samples this block
-    // consumed. We add 1 to round-half-up: blocks that round to a
-    // partial source sample still need to advance the position.
+    // consumed, clamped to the live window so a mid-loop end-marker
+    // drag that crosses the playhead stops us cleanly instead of
+    // overshooting into silence. We add 1 to round-half-up: blocks
+    // that round to a partial source sample still need to advance
+    // the position.
     const int64_t advanced = juce::jmin<int64_t>(
         blockSourceSamples,
-        t.endSample - posSource);
+        liveEnd - posSource);
     posSource += advanced;
 
     // Publish the advanced position as part of the same atomic so a
@@ -361,15 +537,42 @@ void PreviewEngine::getNextAudioBlock(
     // old playhead with a new window. Keep the play window intact
     // (startSample/endSample) and the playing flag; only posSample
     // moves forward.
-    TransportState next = t;
-    next.posSample = posSource;
+    //
+    // Reload once before publishing so the window we write back reflects
+    // any UI-thread setPlayWindow() that arrived during this block —
+    // otherwise we'd overwrite the UI's new window with our stale
+    // snapshot and the marker drag would have no audible effect on
+    // the next iteration.
+    TransportState next = transport.load(std::memory_order_acquire);
+    next.startSample = liveStart;
+    next.endSample   = liveEnd;
+    next.posSample   = posSource;
     transport.store(next, std::memory_order_release);
 
-    if (posSource >= t.endSample)
+    if (posSource >= liveEnd)
     {
-        TransportState idle = next;
-        idle.playing = false;
-        transport.store(idle, std::memory_order_release);
+        if (next.loopEnabled && next.endSample > next.startSample)
+        {
+            // End-of-window reached and we're looping — rewind the
+            // published playhead to the start of the loop window and
+            // keep playing. The next audio block will pick up from
+            // there.
+            TransportState loop = next;
+            loop.posSample = next.startSample;
+            transport.store(loop, std::memory_order_release);
+        }
+        else
+        {
+            // Natural end-of-region: park the playhead at
+            // startSample so a subsequent playFrom() — which uses
+            // posSample as its resume anchor — replays from the
+            // beginning of the window rather than landing on the end
+            // and producing silence.
+            TransportState idle = next;
+            idle.playing   = false;
+            idle.posSample = next.startSample;
+            transport.store(idle, std::memory_order_release);
+        }
     }
 }
 

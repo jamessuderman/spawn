@@ -50,6 +50,10 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/pencil.svg
             resources/icons/lucide/scan.svg
             resources/icons/lucide/squares-subtract.svg
+            resources/icons/lucide/play.svg
+            resources/icons/lucide/pause.svg
+            resources/icons/lucide/square.svg
+            resources/icons/lucide/repeat-2.svg
             resources/assets/Knob.svg
             resources/assets/Button.svg
             resources/licences/LICENCE-PublicSans.md
@@ -68,6 +72,7 @@ if(SPAWN_BUILD_STANDALONE)
             src/sequencer/SequencerView.cpp
             src/toolbar/Toolbar.cpp
             src/toolbar/ToolButton.cpp
+            src/transport/Transport.cpp
             src/settings/PropertyRow.cpp
             src/settings/SettingsView.cpp
             src/settings/ThemeColorSwatch.cpp

@@ -68,12 +68,51 @@ public:
     // Loads an audio file and renders its waveform. Returns true on success.
     // Resets start/end to the full sample range and the zoom window to the
     // full sample.
-    bool loadFile(const juce::File& file);
+    //
+    // `notifyHost` controls whether the onFileLoaded callback fires. Default
+    // true (real user-initiated loads always want the host to decode). The
+    // trim path passes false because trimToRegion() has already published
+    // the trimmed buffer to the engine synchronously, and re-firing the
+    // callback would trigger an unnecessary async re-decode of the temp
+    // WAV that races with the synchronous update.
+    bool loadFile(const juce::File& file, bool notifyHost = true);
+
+    // Render a waveform directly from an in-memory AudioBuffer without
+    // round-tripping through disk or the AudioThumbnail's name-based
+    // cache. Used by the trim path: PreviewEngine::trimToRegion()
+    // already owns the trimmed buffer in memory, so we hand it straight
+    // to the AudioThumbnail via its in-memory setSource overload with
+    // a fresh per-call hash, sidestepping both the temp-WAV write and
+    // any cache-lookup risk from reusing a temp filename.
+    //
+    // The view takes a shared_ptr to keep the buffer alive — the
+    // AudioThumbnail's in-memory reader stores a non-owning raw
+    // pointer, so the buffer must outlive the thumbnail's source.
+    // The shared_ptr is dropped on the next loadFile() /
+    // reloadFromBuffer() call.
+    //
+    // Resets start/end to the full sample range and the zoom window
+    // to the full sample, matching loadFile().
+    void reloadFromBuffer(std::shared_ptr<const juce::AudioBuffer<float>> buffer,
+                          double sampleRate);
 
     // Wire this view to mirror another view's audio source. The partner's
     // loadFile will be called whenever this view loads a file. Pass nullptr
     // to unlink.
     void setPartnerView(WaveformView* other);
+
+    // Host-facing playhead-Timer hooks. The WaveformView owns a Timer
+    // that triggers repaints while the engine is playing (so the
+    // playhead sweeps smoothly). The Speaker click path inside this
+    // view drives the Timer via paint()'s lazy-start guard. External
+    // transport (e.g., the Transport row in the header) calls
+    // startPlayheadTimer() after it asks the engine to start so the
+    // first repaint can latch onto a playing engine without waiting
+    // for an unrelated paint to land. stopPlayheadTimer() is the
+    // symmetrical shutdown — usually unnecessary because the Timer
+    // self-stops when !isPlaying() in its callback.
+    void startPlayheadTimer();
+    void stopPlayheadTimer();
 
     // Set the latched tool. Only Scissors changes input handling; the
     // tool is otherwise cosmetic from the view's perspective. Calling
@@ -91,6 +130,16 @@ public:
     // juce::File that was loaded.
     using OnFileLoaded = std::function<void(const juce::File&)>;
     void setOnFileLoaded(OnFileLoaded handler);
+
+    // Callback fired whenever the start/end chop region changes —
+    // either from a marker drag (live, per pixel) or from a
+    // programmatic setChopRegion(). The callback receives the new
+    // (startSeconds, endSeconds). The host uses this to live-update
+    // the preview engine's play window so a drag during loop
+    // playback takes effect on the next loop iteration.
+    using OnChopRegionChanged = std::function<void(double startSeconds,
+                                                   double endSeconds)>;
+    void setOnChopRegionChanged(OnChopRegionChanged handler);
 
     // Chop region in seconds. The single-region model is a degenerate
     // case of the cut-list model (no cuts → one slice). Both views
@@ -332,6 +381,18 @@ private:
     // publish to the engine. Optional — nullptr is a no-op.
     OnFileLoaded onFileLoaded;
 
+    // Chop-region-changed callback. Fires from notifyChopChanged()
+    // whenever the start/end markers move (live during a drag) or
+    // when setChopRegion() is called. Optional — nullptr is a no-op.
+    OnChopRegionChanged onChopRegionChanged;
+
+    // Owns the buffer the AudioThumbnail is currently rendering from
+    // in the reloadFromBuffer() path. Empty for file-loaded sources
+    // (the file path keeps the disk data alive). Dropped on the next
+    // loadFile() / reloadFromBuffer() so the buffer outlives only
+    // until the next source switch.
+    std::shared_ptr<const juce::AudioBuffer<float>> inMemorySourceBuffer;
+
     // Playhead line thickness (px). 1 px to match the chop markers.
     static constexpr float kPlayheadThicknessPx = 1.0f;
 
@@ -406,6 +467,12 @@ private:
 
     // Push current chop region to partner (if any) and repaint.
     void notifyChopChanged();
+
+    // Shared post-setSource cleanup. Resets chop/zoom/cuts/selection
+    // to the full buffer range and mirrors to the partner if any.
+    // Called by both loadFile and reloadFromBuffer after they have
+    // switched the AudioThumbnail's source.
+    void resetForNewSource();
 };
 
 } // namespace spawn::ui

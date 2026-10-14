@@ -53,9 +53,55 @@ public:
     // clamped silently to the buffer's extent.
     void playFrom(double startSeconds, double endSeconds);
 
+    // Live-update the play window without restarting playback. Used
+    // while the engine is playing (typically looping) so dragging the
+    // start/end markers on the waveform takes effect on the next loop
+    // iteration. posSample and the playing flag are preserved — only
+    // startSample/endSample change. Out-of-range / degenerate values
+    // (startSeconds >= endSeconds, or either beyond the buffer) are
+    // clamped to the loaded buffer's extent, matching playFrom().
+    void setPlayWindow(double startSeconds, double endSeconds);
+
     // Stop playback. After this returns isPlaying() is false and the
-    // next getNextAudioBlock outputs silence.
+    // next getNextAudioBlock outputs silence. posSample is parked at 0
+    // so the next playFrom() (re-trigger) starts from the buffer's
+    // origin. Use pause() if you want to stop the audio but keep the
+    // playhead where it is.
     void stop();
+
+    // Pause playback. Like stop() the audio thread goes silent after
+    // this returns — except posSample is left at its current value so
+    // a subsequent playFrom() that targets the same window would
+    // resume from where we paused. isPlaying() goes false.
+    //
+    // Pausing outside an active transport (no buffer, not playing) is a
+    // no-op.
+    void pause();
+
+    // Loop toggle. When true, hitting endSample in getNextAudioBlock
+    // rewinds posSample back to startSample and keeps playing=true. The
+    // flag is independent of the play window — playFrom / Speaker
+    // clicks / future pad-driven playback all loop within whatever
+    // window is currently armed. Default is off (one-shot playback,
+    // the historical behaviour).
+    //
+    // Mutating the flag while playback is active is safe: the audio
+    // thread re-reads it from the same atomic as the play window on
+    // every block so the next block after the change picks up the
+    // new value without a glitch.
+    void setLoopEnabled(bool enabled) noexcept;
+    bool isLoopEnabled() const noexcept;
+
+    // Current playhead position in seconds, regardless of whether the
+    // engine is playing. After stop() this is 0; after pause() this
+    // is the position where the audio thread stopped.
+    double getPlayheadSeconds() const noexcept;
+
+    // Park the playhead at `seconds` without starting playback. Used
+    // by Transport's Stop handler to "return playhead to start marker"
+    // while leaving the engine idle. Values are clamped to the loaded
+    // buffer's extent. Has no effect when no buffer is loaded.
+    void setPlayheadSeconds(double seconds) noexcept;
 
     // Destructively replace the engine's buffer with the slice
     // [startSeconds, endSeconds] of the current buffer. Stops
@@ -97,6 +143,17 @@ public:
     // actions that operate on the loaded audio.
     bool hasBuffer() const noexcept;
 
+    // Snapshot of the engine's current buffer (shared with the audio
+    // thread). Returns an empty shared_ptr if no buffer has been
+    // loaded. Used by the trim path to hand the trimmed buffer
+    // straight to the WaveformView without a disk round-trip.
+    std::shared_ptr<const juce::AudioBuffer<float>> getBufferSnapshot() const;
+
+    // The sample rate of the source buffer (not the device rate).
+    // Used by the trim path to populate the AudioThumbnail's
+    // in-memory setSource(buffer, rate, hash) call.
+    double getSourceSampleRate() const noexcept;
+
     // juce::AudioSource -----------------------------------------------------
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override;
     void releaseResources() override;
@@ -104,16 +161,17 @@ public:
 
 private:
     // Lock-free transport state. The UI thread writes via playFrom/stop/
-    // setBuffer; the audio thread reads via getNextAudioBlock. The atomic
-    // State carries "playing" vs "idle", the current play window
-    // (startSample, endSample) expressed in source-buffer samples, AND
-    // the running playhead (posSample). Folding the position into the
-    // same atomic as the window is what makes the re-trigger race-free:
-    // playFrom() publishes all three in a single store so the audio
-    // thread can never observe the new window paired with a stale
-    // playhead from the previous play.
+    // pause/setBuffer/setLoopEnabled; the audio thread reads via
+    // getNextAudioBlock. The atomic State carries "playing" vs "idle",
+    // the current play window (startSample, endSample) expressed in
+    // source-buffer samples, the running playhead (posSample), AND the
+    // loop flag. Folding the position into the same atomic as the window
+    // is what makes the re-trigger race-free: playFrom() publishes all
+    // four in a single store so the audio thread can never observe the
+    // new window paired with a stale playhead from the previous play.
     struct TransportState {
         bool    playing     = false;
+        bool    loopEnabled = false;
         int64_t startSample = 0;
         int64_t endSample   = 0;
         int64_t posSample   = 0;  // running playhead, source samples

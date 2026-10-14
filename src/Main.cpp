@@ -15,6 +15,7 @@
 #include "settings/SettingsView.h"
 #include "stores/SettingsStore.h"
 #include "toolbar/Toolbar.h"
+#include "transport/Transport.h"
 #include "ui/fonts/Fonts.h"
 #include "ui/lookandfeel/Palette.h"
 #include "ui/lookandfeel/SpawnLookAndFeel.h"
@@ -164,6 +165,7 @@ namespace
                     toolbar = std::make_unique<spawn::ui::Toolbar>(palette);
                     display = std::make_unique<spawn::ui::Display>(palette);
                     sampleControls = std::make_unique<spawn::ui::SampleControls>(palette);
+                    transport = std::make_unique<spawn::ui::Transport>(palette);
 
                     // The WaveformView (and its AudioThumbnail) live for the whole
                     // window lifetime, so a loaded file sticks across content swaps.
@@ -178,11 +180,25 @@ namespace
                     // single hook covers both pickers and drops.
                     waveformView->setOnFileLoaded(
                         [this](const juce::File& f) { loadSampleAsync(f); });
+                    // Live-update the engine's play window whenever the
+                    // start/end markers move. We only push while playing
+                    // because setPlayWindow() is a no-op for an idle
+                    // engine — the next playFrom() will publish the
+                    // window fresh. Gated on isPlaying() so an unrelated
+                    // drag (e.g. adjusting the active region on a
+                    // stopped transport) doesn't disturb the idle state.
+                    waveformView->setOnChopRegionChanged(
+                        [this](double startSeconds, double endSeconds)
+                        {
+                            if (engine.isPlaying())
+                                engine.setPlayWindow(startSeconds, endSeconds);
+                        });
 
                     addAndMakeVisible(controlHeader.get());
                     addAndMakeVisible(toolbar.get());
                     addAndMakeVisible(display.get());
                     addAndMakeVisible(sampleControls.get());
+                    addAndMakeVisible(transport.get());
 
                     // Wire the volume knob: every value change publishes
                     // to the engine's gain. The engine stores an atomic
@@ -194,6 +210,94 @@ namespace
                     // engine so the very first click plays at the visible
                     // knob position even before the user touches it.
                     engine.setGain(0.5f);
+
+                    // Transport buttons drive the PreviewEngine from the
+                    // header row. Play resumes from the engine's current
+                    // playhead (posSample) — whatever it is at the time
+                    // of the click. That single rule covers all three
+                    // cases we care about:
+                    //   - cold start: posSample == 0 (engine default)
+                    //   - after Pause: posSample is exactly where Pause
+                    //     left it
+                    //   - after Stop: Stop parks posSample at
+                    //     startSeconds, so Play resumes from there
+                    // The play window runs to the end of the loaded
+                    // buffer regardless of any cuts, so the transport
+                    // bypasses the chop list that the Speaker tool
+                    // plays into.
+                    transport->setOnPlay([this]
+                    {
+                        if (waveformView == nullptr || !engine.hasBuffer())
+                            return;
+                        const double start = engine.getCurrentPositionSeconds();
+                        const double end   = waveformView->getEndSeconds();
+                        if (end <= start)
+                            return;
+                        engine.playFrom(start, end);
+                        // Mirror into the transport's play button so it
+                        // tints to the app primary immediately, without
+                        // waiting for the polling Timer to catch up.
+                        transport->setPlaying(true);
+                        // Kick the playhead Timer — without this the
+                        // WaveformView has no reason to repaint until
+                        // the user moves the mouse or the window
+                        // resizes, leaving the playhead invisible
+                        // until several seconds have elapsed.
+                        waveformView->startPlayheadTimer();
+                    });
+                    // Stop halts audio and parks the playhead at the
+                    // chop start marker — semantically "where Play would
+                    // start from". The engine's stop() parks at 0, so
+                    // we follow it with setPlayheadSeconds(start) to
+                    // honour the user's start marker.
+                    transport->setOnStop([this]
+                    {
+                        engine.stop();
+                        // Drop the play button back to its idle tint
+                        // before the engine's playing flag is read by
+                        // the polling Timer.
+                        transport->setPlaying(false);
+                        if (waveformView != nullptr)
+                        {
+                            engine.setPlayheadSeconds(waveformView->getStartSeconds());
+                            // Stop the Timer explicitly so the final
+                            // repaint that draws the parked playhead
+                            // fires right now; without this the Timer
+                            // keeps running until its callback notices
+                            // !isPlaying().
+                            waveformView->stopPlayheadTimer();
+                        }
+                    });
+                    // Pause halts audio but leaves the playhead where
+                    // it currently is. The engine publishes the new
+                    // transport state with playing=false and the
+                    // posSample that was current at the time of the
+                    // call.
+                    transport->setOnPause([this]
+                    {
+                        engine.pause();
+                        transport->setPlaying(false);
+                        if (waveformView != nullptr)
+                            waveformView->stopPlayheadTimer();
+                    });
+                    // Loop is a sticky toggle. The Transport component
+                    // already tracks its own active state; we mirror it
+                    // into the engine so getNextAudioBlock can decide
+                    // whether to rewind at end-of-window.
+                    transport->setOnLoopToggle([this](bool enabled)
+                    {
+                        engine.setLoopEnabled(enabled);
+                    });
+                    // Push the current engine loop state into the
+                    // Transport's visual toggle so re-attaching after a
+                    // content swap doesn't visually reset the user's
+                    // preference.
+                    transport->setLoopActive(engine.isLoopEnabled());
+                    // Wire the engine so the transport's play-button
+                    // tint can self-sync to engine-driven transitions
+                    // (natural end of playback, loop rewind) that the
+                    // host handlers don't directly observe.
+                    transport->setPreviewEngine(&engine);
 
                     // Default content: waveform editor. Drop a file on the
                     // Display to load it (the WaveformView is the dnd target).
@@ -242,19 +346,20 @@ namespace
                     //   ┌──────────────────────────────────────────────┐
                     //   │ kOuterPaddingY = 16 px                     │
                     //   │ kHeaderRow tall, full width                │
-                    //   │   ┌──────────────────────┐ ┌────────────┐   │
-                    //   │   │ ControlHeader (left) │ │ Sample     │   │
-                    //   │   │ Toolbar      (left) │ │ Controls   │   │
-                    //   │   │ (column, gap inside) │ │ (knob)     │   │
-                    //   │   └──────────────────────┘ └────────────┘   │
+                    //   │   ┌──────────────────────┐ ┌──────┐ ┌───┐   │
+                    //   │   │ ControlHeader (left) │ │Trans-│ │Vol│   │
+                    //   │   │ Toolbar      (left) │ │ port │ │knb│   │
+                    //   │   │ (column, gap inside) │ │strip │ └───┘   │
+                    //   │   └──────────────────────┘ └──────┘         │
                     //   │ kGap                                         │
                     //   │ Display (full width, Display::kHeight)      │
                     //   └──────────────────────────────────────────────┘
                     // The header row is a single horizontal band that
                     // contains a left column (display buttons on top of
-                    // tool buttons) and a right side (the volume knob).
-                    // Both columns sit inside the same row so the knob
-                    // can never overlap the button strips.
+                    // tool buttons), a transport strip pushed to the
+                    // right next to the volume knob, and the volume
+                    // knob on the far right. All three sit inside the
+                    // same row so nothing can clip into the row below.
                     const int headerRowHeight = juce::jmax(
                         spawn::ui::ControlHeader::kHeight + kGap
                             + spawn::ui::Toolbar::kHeight,
@@ -265,15 +370,45 @@ namespace
                     topRow.setY(kOuterPaddingY);
                     topRow.setHeight(headerRowHeight);
 
+                    // Right side of the row: sample knob first (far
+                    // right), then the transport strip immediately to
+                    // its left. removeFromRight pulls them off the row
+                    // in right-to-left order so the layout is
+                    // knob | transport | (left column).
+                    auto sampleBounds = topRow.removeFromRight(
+                        spawn::ui::SampleControls::kSize);
+                    sampleBounds.setY(topRow.getY()
+                        + (headerRowHeight - sampleBounds.getHeight()) / 2);
+                    sampleBounds.setSize(spawn::ui::SampleControls::kSize,
+                                         spawn::ui::SampleControls::kSize);
+                    sampleControls->setBounds(sampleBounds);
+
+                    // Transport sits between the left column and the
+                    // volume knob. Vertically aligned with the display
+                    // buttons (ControlHeader) at the top of the row —
+                    // not centred in the row band — so the four chips
+                    // read as a sibling strip of the header.
+                    auto transportBounds = topRow.removeFromRight(
+                        kGap + transport->getPreferredWidth());
+                    const int transportStripHeight = spawn::ui::Transport::kHeight;
+                    transportBounds.setY(topRow.getY());
+                    transportBounds.setHeight(transportStripHeight);
+                    // removeFromRight above pulled kGap extra to the
+                    // left of the transport, leaving the inner width
+                    // correct; just snap the height and keep width.
+                    transport->setBounds(
+                        transportBounds.getX(),
+                        transportBounds.getY(),
+                        transport->getPreferredWidth(),
+                        transportStripHeight);
+
                     // Left column: ControlHeader top-aligned, Toolbar
                     // bottom-aligned so the two strips read as a stacked
                     // pair hugging the top and bottom of the row (the
                     // Toolbar then sits flush with the row's bottom edge,
                     // directly above the Display below).
                     auto leftColumn = topRow;
-                    leftColumn.setWidth(juce::jmax(0,
-                        topRow.getWidth() - kGap
-                            - spawn::ui::SampleControls::kSize));
+                    leftColumn.setWidth(juce::jmax(0, topRow.getWidth()));
 
                     auto headerBounds = leftColumn;
                     headerBounds.setHeight(spawn::ui::ControlHeader::kHeight);
@@ -284,16 +419,6 @@ namespace
                         - spawn::ui::Toolbar::kHeight);
                     toolbarBounds.setHeight(spawn::ui::Toolbar::kHeight);
                     toolbar->setBounds(toolbarBounds);
-
-                    // Right side of the header row: the volume knob,
-                    // square, vertically centred in the row.
-                    auto sampleBounds = topRow.removeFromRight(
-                        spawn::ui::SampleControls::kSize);
-                    sampleBounds.setY(topRow.getY()
-                        + (headerRowHeight - sampleBounds.getHeight()) / 2);
-                    sampleBounds.setSize(spawn::ui::SampleControls::kSize,
-                                         spawn::ui::SampleControls::kSize);
-                    sampleControls->setBounds(sampleBounds);
 
                     // Display sits below the header row, full width.
                     auto displayBounds = getLocalBounds().withZeroOrigin()
@@ -478,8 +603,8 @@ namespace
                     if (!engine.isPlaying() && !engine.hasBuffer())
                         return;
 
-                    // 1) Snapshot the cuts BEFORE we ask the view to load
-                    //    the trimmed temp file (loadFile clears the cuts).
+                    // 1) Snapshot the cuts BEFORE we ask the view to reload
+                    //    (reloadFromBuffer clears the cuts).
                     const double trimStart = waveformView->getStartSeconds();
                     const double trimEnd = waveformView->getEndSeconds();
                     std::vector<double> oldCuts = waveformView->getCuts();
@@ -488,58 +613,46 @@ namespace
                     //    stops playback and parks the playhead at 0.
                     engine.trimToRegion(trimStart, trimEnd);
 
-                    // 3) Materialise the trimmed buffer to a temp WAV so
-                    //    the AudioThumbnail can read it. The file lives
-                    //    for the duration of the next load/trim and gets
-                    //    replaced; a future shutdown hook will sweep.
-                    const auto tempFile = juce::File::getSpecialLocation(
-                            juce::File::tempDirectory)
-                        .getChildFile("spawn-trim-cache.wav");
-                    if (!engine.writeBufferToWav(tempFile))
+                    // 3) Hand the trimmed buffer straight to the view via
+                    //    its in-memory reload path. No temp WAV, no disk
+                    //    round-trip, no AudioThumbnail cache lookup by
+                    //    name — the trimmed buffer goes from the engine
+                    //    to the thumbnail's setSource(buffer, ...)
+                    //    overload directly. This eliminates the
+                    //    user-reported "stale cached waveform after a
+                    //    trim" failure mode where the thumbnail's
+                    //    name-keyed cache could serve a previous trim's
+                    //    peaks under a reused temp filename.
+                    auto trimmedBuffer = engine.getBufferSnapshot();
+                    const double trimmedRate = engine.getSourceSampleRate();
+                    if (trimmedBuffer == nullptr || trimmedBuffer->getNumSamples() == 0)
                     {
                         juce::Logger::writeToLog(
-                            "trimOutsideMarkers: failed to write temp WAV at "
-                            + tempFile.getFullPathName());
+                            "trimOutsideMarkers: engine buffer empty after trim");
                         return;
                     }
+                    // Take a shared_ptr by value — the view stores it
+                    // so the buffer outlives the AudioThumbnail's
+                    // non-owning pointer into it. The engine keeps its
+                    // own shared_ptr to the same buffer; both copies
+                    // stay alive for as long as either needs them.
+                    waveformView->reloadFromBuffer(trimmedBuffer, trimmedRate);
 
                     // 4) Compute the shifted cut list (Q3a: shift survivors,
-                    //    drop those outside the new region). We need the
-                    //    new buffer's length to clamp the upper end — read
-                    //    it from the engine via getCurrentPositionSeconds
-                    //    (no, that's the playhead). The engine's
-                    //    totalSourceSamples is atomic; we just trust the
-                    //    loadFile call to refresh the view's notion of
-                    //    length next.
-                    std::vector<double> shifted;
-                    shifted.reserve(oldCuts.size());
+                    //    drop those outside the new region). The view
+                    //    already knows the new length now (reloadFromBuffer
+                    //    populated thumbnail.getTotalLength() from the
+                    //    buffer's numSamples / sampleRate), so we can
+                    //    clamp on both ends.
+                    const double newLength = waveformView->getEndSeconds();
+                    std::vector<double> clamped;
+                    clamped.reserve(oldCuts.size());
                     for (const double c : oldCuts)
                     {
                         const double rel = c - trimStart;
-                        if (rel <= 0.0) continue; // outside the new region (left)
-                        shifted.push_back(rel);
-                    }
-                    // We don't know the new length yet (the engine has it
-                    // but doesn't expose it; the view will get it from
-                    // loadFile). Drop the upper-bound clamp here and
-                    // re-apply after loadFile via the view's own
-                    // dedup/clamps when we setCuts().
-
-                    // 5) Reload the view from the temp WAV. loadFile
-                    //    clears cuts and resets the chop region to
-                    //    [0, newLength] — exactly what we want.
-                    waveformView->loadFile(tempFile);
-
-                    // 6) Re-apply the shifted cut list. setCuts trusts the
-                    //    input is sorted + in-range; clamping here is
-                    //    conservative (drops anything past the new length).
-                    const double newLength = waveformView->getEndSeconds();
-                    std::vector<double> clamped;
-                    clamped.reserve(shifted.size());
-                    for (const double c : shifted)
-                    {
-                        if (c >= newLength) continue; // outside the new region (right)
-                        clamped.push_back(c);
+                        if (rel <= 0.0) continue;          // outside (left)
+                        if (rel >= newLength) continue;    // outside (right)
+                        clamped.push_back(rel);
                     }
                     waveformView->setCuts(std::move(clamped));
                 }
@@ -622,6 +735,7 @@ namespace
                 std::unique_ptr<spawn::ui::Toolbar> toolbar;
                 std::unique_ptr<spawn::ui::Display> display;
                 std::unique_ptr<spawn::ui::SampleControls> sampleControls;
+                std::unique_ptr<spawn::ui::Transport> transport;
                 std::unique_ptr<spawn::ui::WaveformView> waveformView;
                 std::unique_ptr<juce::FileChooser> fileChooser;
             };

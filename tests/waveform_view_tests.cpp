@@ -15,11 +15,13 @@
 
 #include <JuceHeader.h>
 
+#include "../src/audio/preview/PreviewEngine.h"
 #include "../src/stores/SettingsStore.h"
 #include "../src/ui/icons/Icons.h"
 #include "../src/ui/lookandfeel/Palette.h"
 #include "../src/waveform/WaveformView.h"
 
+using spawn::audio::PreviewEngine;
 using spawn::ui::Palette;
 using spawn::ui::SettingsStore;
 using spawn::ui::WaveformView;
@@ -100,6 +102,23 @@ juce::File makeTempDir(const juce::String& tag)
                       + juce::String(juce::Random::getSystemRandom().nextInt64()));
     dir.createDirectory();
     return dir;
+}
+
+// Build a stereo buffer holding a constant sample on each channel —
+// mirror of preview_engine_tests.cpp's helper, duplicated here so the
+// trim-path integration test can shape the engine's buffer without
+// pulling in the audio engine test's full fixture.
+std::shared_ptr<juce::AudioBuffer<float>> makeStereoConstantBuffer(
+    int numSamples, float left, float right)
+{
+    auto buf = std::make_shared<juce::AudioBuffer<float>>(2, numSamples);
+    buf->clear();
+    for (int i = 0; i < numSamples; ++i)
+    {
+        buf->setSample(0, i, left);
+        buf->setSample(1, i, right);
+    }
+    return buf;
 }
 
 } // namespace
@@ -412,6 +431,124 @@ public:
             // so the selection's left edge expands left to 0.
             expect(view.removeCut(0));
             expectSelected(view, 0.0, 1.0);
+        }
+
+        beginTest("loadFile populates start/end synchronously for a "
+                  "well-formed WAV");
+        {
+            // loadFile() must read thumbnail.getTotalLength()
+            // synchronously (after setSource) and use it to reset
+            // startSeconds/endSeconds. If it reads the length async,
+            // endSeconds would be 0 here and a follow-up drag would
+            // not be able to move markers past 0.
+            auto dir = makeTempDir("sync_len");
+            const auto file = writeSilentWav(dir); // 1 s, 44.1 kHz
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(file));
+
+            // Should be (0, 1.0), not (0, 0). If this fails the view
+            // reset the chop region to a degenerate empty range and
+            // the trim path's follow-up drag would do nothing.
+            expectEquals(view.getStartSeconds(), 0.0);
+            expectEquals(view.getEndSeconds(),   1.0);
+        }
+
+        beginTest("trimmed-WAV reload keeps a usable chop region");
+        {
+            // Reproduces the user-reported trim bug end-to-end via the
+            // file-based path that was used before reloadFromBuffer():
+            //   1. engine holds a 1 s buffer
+            //   2. trimToRegion(0.25, 0.75) → 0.5 s engine buffer
+            //   3. writeBufferToWav writes 0.5 s of audio to disk
+            //   4. WaveformView::loadFile reloads that WAV
+            //   5. view's startSeconds/endSeconds must reflect 0.5 s
+            // If step 5 fails (e.g. (0, 0)), the next drag would have
+            // no usable range and a follow-up trim would degenerate.
+            auto dir = makeTempDir("trim_reload");
+            const auto temp = dir.getChildFile("spawn-trim-rewrite.wav");
+
+            PreviewEngine engine;
+            const int nSamples = 48000; // 1 s at 48 kHz
+            engine.setBuffer(
+                makeStereoConstantBuffer(nSamples, 0.5f, 0.5f),
+                48000.0);
+
+            engine.trimToRegion(0.25, 0.75); // → 0.5 s buffer
+            expect(engine.writeBufferToWav(temp));
+            expect(temp.existsAsFile());
+
+            Palette palette(store);
+            WaveformView view(palette);
+            expect(view.loadFile(temp));
+
+            // The view should now reflect the trimmed length
+            // synchronously after loadFile returns — not after the
+            // AudioThumbnail's background scan completes. If this
+            // is (0, 0) the view has no usable range and a follow-up
+            // drag/trim will misbehave.
+            expectEquals(view.getStartSeconds(), 0.0);
+            expectEquals(view.getEndSeconds(),   0.5);
+        }
+
+        beginTest("reloadFromBuffer: takes an in-memory buffer and "
+                  "produces the right length");
+        {
+            // The new trim path. Engine trims, hands its buffer to
+            // the view directly via reloadFromBuffer — no temp WAV,
+            // no AudioThumbnail cache lookup by name. The view must
+            // report the buffer's length synchronously and own the
+            // buffer so the AudioThumbnail's non-owning reader pointer
+            // doesn't dangle.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000, 0.5f, 0.5f),
+                48000.0);
+            engine.trimToRegion(0.25, 0.75); // → 0.5 s
+
+            auto trimmed = engine.getBufferSnapshot();
+            expect(trimmed != nullptr);
+            expectEquals(trimmed->getNumSamples(), 24000);
+
+            Palette palette(store);
+            WaveformView view(palette);
+            view.reloadFromBuffer(trimmed, engine.getSourceSampleRate());
+
+            expectEquals(view.getStartSeconds(), 0.0);
+            expectEquals(view.getEndSeconds(),   0.5);
+        }
+
+        beginTest("reloadFromBuffer: chained reloads use the latest "
+                  "buffer, not a cached earlier one");
+        {
+            // The user-reported bug: "very long area inside the start
+            // and end trimmed to a very short audio" — the AudioThumbnail
+            // was serving a previous trim's waveform. The in-memory
+            // handoff path uses a fresh hash per call so the
+            // AudioThumbnail cache cannot serve a stale entry. Two
+            // reloads in a row with different buffer lengths must each
+            // produce their own length.
+            PreviewEngine engine;
+            engine.setBuffer(
+                makeStereoConstantBuffer(48000 * 4, 0.5f, 0.5f), // 4 s
+                48000.0);
+
+            Palette palette(store);
+            WaveformView view(palette);
+
+            // Reload 1: trim to 0.5 s, reload.
+            engine.trimToRegion(0.5, 1.0);
+            view.reloadFromBuffer(engine.getBufferSnapshot(),
+                                  engine.getSourceSampleRate());
+            expectEquals(view.getEndSeconds(), 0.5);
+
+            // Reload 2: trim again on the trimmed buffer. The new
+            // buffer is 0.25 s. The view MUST show 0.25 s, not 0.5 s
+            // from the previous reload (the old failure mode).
+            engine.trimToRegion(0.1, 0.35);
+            view.reloadFromBuffer(engine.getBufferSnapshot(),
+                                  engine.getSourceSampleRate());
+            expectEquals(view.getEndSeconds(), 0.25);
         }
     }
 

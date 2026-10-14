@@ -31,14 +31,14 @@ public:
 // New uses should pick the role first, then the colour. Resist
 // reaching for primary() when something is a structural element —
 // leave that to marker().
-    static constexpr juce::uint32 kDefaultPrimary    = 0xFFFF5C2E; // Ember — transient cues (scissors cursor, knob value arc)
-    static constexpr juce::uint32 kDefaultInk        = 0xFF0E0F12; // Ink (window + panel base)
-    static constexpr juce::uint32 kDefaultPanelFill  = 0xFF0E0F12; // brighter(0.04f) — derived at runtime
-    static constexpr juce::uint32 kDefaultBorderIdle = 0x1FE8E6E1; // Bone @ 12%
-    static constexpr juce::uint32 kDefaultPlaceholder= 0x66E8E6E1; // Bone @ 40%
-    static constexpr juce::uint32 kDefaultBodyText   = 0xCCE8E6E1; // Bone @ 80%
-    static constexpr juce::uint32 kDefaultLabelText  = 0xFFE8E6E1; // Bone @ 100%
-    static constexpr juce::uint32 kDefaultButtonIdle = 0xCCE8E6E1; // Bone @ 80% (icon tint at rest)
+    static constexpr juce::uint32 kDefaultPrimary     = 0xFFFF5C2E; // Ember — transient cues (scissors cursor, knob value arc)
+    static constexpr juce::uint32 kDefaultInk         = 0xFF0E0F12; // Ink (window + panel base)
+    static constexpr juce::uint32 kDefaultPanelFill   = 0xFF0E0F12; // brighter(0.04f) — derived at runtime
+    static constexpr juce::uint32 kDefaultBorderIdle  = 0x1FE8E6E1; // Bone @ 12%
+    static constexpr juce::uint32 kDefaultPlaceholder = 0x66E8E6E1; // Bone @ 40%
+    static constexpr juce::uint32 kDefaultBodyText    = 0xCCE8E6E1; // Bone @ 80%
+    static constexpr juce::uint32 kDefaultLabelText   = 0xFFE8E6E1; // Bone @ 100%
+    static constexpr juce::uint32 kDefaultButtonIdle  = 0xCCE8E6E1; // Bone @ 80% (icon tint at rest)
     // Bone @ 50% — used for the playback playhead line on the waveform.
     // Sits between bodyText (80%) and placeholder (40%) so it reads as
     // a mid-tone, distinct from the active chop (ember) and the chop

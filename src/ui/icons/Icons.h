@@ -27,6 +27,10 @@ public:
         Pencil,
         Scan,
         Crop,
+        Play,
+        Pause,
+        Square,
+        Repeat2,
     };
 
     // Parse and cache the icon at the requested pixel size.

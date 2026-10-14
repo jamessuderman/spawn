@@ -114,6 +114,19 @@ WaveformView::~WaveformView()
 
 void WaveformView::paint(juce::Graphics& g)
 {
+    // Self-managing playhead Timer. Any code path that triggers a
+    // repaint (transport Play, Speaker click, mouse move, window
+    // resize, ...) will start the Timer if the engine is currently
+    // playing, so the playhead updates at 60 Hz even when the host
+    // didn't explicitly pair the engine call with startTimer(). The
+    // Timer stops itself from timerCallback() when the engine goes
+    // idle.
+    if (previewEngine != nullptr && previewEngine->isPlaying())
+    {
+        if (!isTimerRunning())
+            startTimer(kPlayheadRepaintMs);
+    }
+
     // Fill the whole component with the Ink background.
     g.fillAll(palette.ink());
 
@@ -152,7 +165,7 @@ void WaveformView::paint(juce::Graphics& g)
 
 void WaveformView::resized() {}
 
-bool WaveformView::loadFile(const juce::File& file)
+bool WaveformView::loadFile(const juce::File& file, bool notifyHost)
 {
     if (!file.existsAsFile())
         return false;
@@ -171,44 +184,113 @@ bool WaveformView::loadFile(const juce::File& file)
         previewEngine->stop();
     stopTimer();
 
+    // Drop any in-memory buffer the trim path handed us — the file
+    // we're about to load becomes the thumbnail's source instead,
+    // and we don't want to keep two large buffers alive at once.
+    inMemorySourceBuffer.reset();
+
     thumbnail.setSource(new juce::FileInputSource(file));
     repaint();
 
     if (partner != nullptr)
         partner->loadFile(file);
 
-    // Reset the active chop and zoom to the full sample range so a freshly
-    // loaded file starts with the entire waveform selected and fully visible.
-    // Cuts from a previously-loaded file are discarded — chop boundaries
-    // don't carry across samples.
+    resetForNewSource();
+
+    // Notify the host so it can kick off a sample decode for the audio
+    // engine. The view does not own the engine and never calls into it
+    // directly from here. Skipped when the caller has already updated
+    // the engine itself (e.g. the trim path, which publishes the
+    // trimmed buffer synchronously via PreviewEngine::trimToRegion).
+    if (notifyHost && onFileLoaded != nullptr)
+        onFileLoaded(file);
+
+    return true;
+}
+
+void WaveformView::reloadFromBuffer(
+    std::shared_ptr<const juce::AudioBuffer<float>> buffer,
+    double sampleRate)
+{
+    // In-memory handoff for the trim path. The engine already owns the
+    // trimmed buffer; we hand it straight to the AudioThumbnail via
+    // its in-memory setSource overload (no disk, no FileInputSource,
+    // no name-based cache lookup) and use a fresh hash per call so
+    // the cache never serves a stale entry from a prior trim.
+    if (previewEngine != nullptr)
+        previewEngine->stop();
+    stopTimer();
+
+    // Drop the previous in-memory buffer (if any) before storing the
+    // new one. The AudioThumbnail's reader holds a non-owning raw
+    // pointer into this shared_ptr's pointee, so the buffer must
+    // outlive the thumbnail's source. We take ownership here; the
+    // next loadFile / reloadFromBuffer will replace this.
+    inMemorySourceBuffer = std::move(buffer);
+
+    // A per-call hash keeps the thumbnail cache from confusing one
+    // trim's data with another. The cache holds thumbnails by hash;
+    // a fresh hash on every reload guarantees a fresh scan even if
+    // some other code path ever tried to load a thumbnail of the
+    // same logical buffer twice.
+    static std::atomic<int64_t> reloadHashCounter { 0 };
+    const int64_t hash = reloadHashCounter.fetch_add(1)
+                         + juce::Time::getMillisecondCounter();
+    thumbnail.setSource(inMemorySourceBuffer.get(), sampleRate, hash);
+    repaint();
+
+    // No partner mirror here — reloadFromBuffer is only ever called
+    // from the trim path which doesn't have a partner wired today.
+    // If a partner ever becomes wired, mirroring via setChopRegion()
+    // would need a follow-up so the partner's bounds match.
+
+    resetForNewSource();
+}
+
+void WaveformView::resetForNewSource()
+{
+    // Shared post-setSource cleanup. Resets the active chop and zoom
+    // to the full sample range, clears cuts, and selects the whole
+    // buffer — applies to both loadFile (file-based) and
+    // reloadFromBuffer (in-memory).
+    //
+    // Cuts from a previously-loaded buffer are discarded — chop
+    // boundaries don't carry across samples. A freshly-loaded sample
+    // is a single clip spanning the whole buffer; select it so the
+    // highlight appears immediately and the user can see what's about
+    // to be edited.
     const double length = thumbnail.getTotalLength();
     startSeconds = 0.0;
     endSeconds   = length;
     zoomStart    = 0.0;
     zoomEnd      = length;
     cuts.clear();
-    // A freshly-loaded sample is a single clip spanning the whole
-    // buffer; select it so the highlight appears immediately and the
-    // user can see what's about to be edited. The trim path also
-    // funnels through loadFile (writing a temp WAV and reloading),
-    // so the same rule auto-resets selection after a trim.
     selectedClipStart = 0.0;
     selectedClipEnd   = length;
     if (partner != nullptr)
         partner->setChopRegion(startSeconds, endSeconds);
-
-    // Notify the host so it can kick off a sample decode for the audio
-    // engine. The view does not own the engine and never calls into it
-    // directly from here.
-    if (onFileLoaded != nullptr)
-        onFileLoaded(file);
-
-    return true;
 }
 
 void WaveformView::setPartnerView(WaveformView* other)
 {
     partner = other;
+}
+
+void WaveformView::startPlayheadTimer()
+{
+    // Idempotent — paint()'s lazy-start guard also catches the first
+    // repaint that follows an external start, so a second startTimer
+    // while the Timer is already running is a cheap no-op.
+    startTimer(kPlayheadRepaintMs);
+}
+
+void WaveformView::stopPlayheadTimer()
+{
+    // Symmetric to start. The Timer callback already self-stops when
+    // !isPlaying(); this method is for hosts that want to be explicit
+    // (e.g., to halt repaints before the audio callback has flipped
+    // the engine to idle).
+    stopTimer();
 }
 
 void WaveformView::setActiveTool(Tool tool)
@@ -244,6 +326,11 @@ void WaveformView::setPreviewEngine(spawn::audio::PreviewEngine* engine)
 void WaveformView::setOnFileLoaded(OnFileLoaded handler)
 {
     onFileLoaded = std::move(handler);
+}
+
+void WaveformView::setOnChopRegionChanged(OnChopRegionChanged handler)
+{
+    onChopRegionChanged = std::move(handler);
 }
 
 void WaveformView::setChopRegion(double startSecondsToUse,
@@ -1611,6 +1698,14 @@ void WaveformView::notifyChopChanged()
     // drag.
     if (partner != nullptr)
         partner->setChopRegion(startSeconds, endSeconds);
+    // Also notify the host so it can keep the preview engine's play
+    // window in sync — necessary for live drags during loop playback,
+    // where the engine's frozen-at-click window would otherwise lag
+    // the markers. The host decides whether to push the change to the
+    // engine (e.g. only while isPlaying() so we don't disturb an idle
+    // engine).
+    if (onChopRegionChanged != nullptr)
+        onChopRegionChanged(startSeconds, endSeconds);
 }
 
 } // namespace spawn::ui
