@@ -24,6 +24,7 @@
 #include "ui/fonts/Fonts.h"
 #include "ui/lookandfeel/Palette.h"
 #include "ui/lookandfeel/SpawnLookAndFeel.h"
+#include "waveform/ClipFadeRemap.h"
 #include "waveform/WaveformView.h"
 
 namespace
@@ -752,7 +753,15 @@ namespace
                         if (rel >= newLength) continue;    // outside (right)
                         clamped.push_back(rel);
                     }
-                    waveformView->setCuts(std::move(clamped));
+                    // Pass clamped cuts by copy (NOT std::move) — the lock and
+                    // fade re-maps downstream both read clamped.size()
+                    // and its element values to map onto the new clip
+                    // list. std::move here would empty clamped and
+                    // leave the lock/fade re-maps blind to the actual
+                    // surviving cut set, which silently nukes every
+                    // fade after a trim. setCuts takes its argument
+                    // by value so passing the lvalue copies.
+                    waveformView->setCuts(clamped);
 
                     // 5) Re-map locks onto the new clip list. Locks
                     //    are positional, so each surviving clip index
@@ -785,52 +794,14 @@ namespace
                     }
                     waveformView->setClipLocks(std::move(newLocks));
 
-                    // 6) Re-map fades onto the new clip list. For
-                    //    each new clip, the fade-in comes from the
-                    //    original clip that contained the new clip's
-                    //    left edge, and the fade-out from the
-                    //    original clip that contained the new clip's
-                    //    right edge. Clips fully inside the trim
-                    //    region (i.e. middle clips whose right edge
-                    //    is at a surviving cut) keep their fades
-                    //    verbatim. The LAST new clip's fade-out is
-                    //    dropped: its original right boundary was
-                    //    past trimEnd and got cut, so the original
-                    //    fadeOut's right anchor is now past the
-                    //    buffer — the handle would be unreachable
-                    //    and the fade audio would only play partway.
-                    //    The user can re-add the fade-out if they
-                    //    still want one.
-                    const int numNewClips = static_cast<int>(clamped.size()) + 1;
-                    std::vector<spawn::ui::WaveformView::ClipFade> newFades;
-                    newFades.reserve(clamped.size() + 1);
-                    for (int newIdx = 0; newIdx < numNewClips; ++newIdx)
-                    {
-                        const double newLeftSec = (newIdx == 0)
-                            ? 0.0 : clamped[newIdx - 1];
-                        const double newRightSec = (newIdx == numNewClips - 1)
-                            ? newLength : clamped[newIdx];
-                        const double origLeft = newLeftSec + trimStart;
-                        const double origRight = newRightSec + trimStart;
-                        const bool isLastClip = (newIdx == numNewClips - 1);
-                        spawn::ui::WaveformView::ClipFade fade{};
-                        const int inClip = originalClipIndexContaining(
-                            origLeft, oldCuts, oldLength);
-                        const int outClip = originalClipIndexContaining(
-                            origRight, oldCuts, oldLength);
-                        if (inClip >= 0
-                            && inClip < static_cast<int>(oldFades.size()))
-                            fade.fadeInSeconds = oldFades[inClip].fadeInSeconds;
-                        // Preserve the fade-out only for non-last
-                        // clips. The last clip's right edge was cut
-                        // by the trim and its original fadeOut's
-                        // anchor is now off-buffer.
-                        if (!isLastClip
-                            && outClip >= 0
-                            && outClip < static_cast<int>(oldFades.size()))
-                            fade.fadeOutSeconds = oldFades[outClip].fadeOutSeconds;
-                        newFades.push_back(fade);
-                    }
+                    // 6) Re-map fades onto the new clip list. The
+                    //    helper applies the per-edge mapping and the
+                    //    fade-out boundary-side correction in one
+                    //    place (and is unit-tested against this
+                    //    exact scenario).
+                    auto newFades = spawn::waveform::rebuildClipFadesAfterTrim(
+                        oldCuts, oldLength, oldFades,
+                        trimStart, trimEnd, clamped);
                     waveformView->setClipFades(std::move(newFades));
                 }
 

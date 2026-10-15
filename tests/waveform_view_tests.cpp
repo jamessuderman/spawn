@@ -19,6 +19,7 @@
 #include "../src/stores/SettingsStore.h"
 #include "../src/ui/icons/Icons.h"
 #include "../src/ui/lookandfeel/Palette.h"
+#include "../src/waveform/ClipFadeRemap.h"
 #include "../src/waveform/WaveformView.h"
 
 using spawn::audio::PreviewEngine;
@@ -1140,9 +1141,116 @@ public:
     }
 };
 
+// Regression coverage for "trim drops fade-outs on surviving chops".
+// The trim path in Main.cpp runs the clip → clip remap through
+// spawn::waveform::rebuildClipFadesAfterTrim before calling
+// setClipFades. Earlier, the right-edge lookup returned the clip on
+// the right side of a surviving cut, swapping each internal fade-out
+// with the next clip's fade (typically 0.0) — visible to the user
+// as "every fade vanished after a trim". This test pins the
+// correct behavior for a representative scenario.
+class ClipFadeRemapTests : public juce::UnitTest {
+public:
+    ClipFadeRemapTests() : juce::UnitTest("ClipFadeRemap after trim") {}
+
+    void runTest() override
+    {
+        using Fade = spawn::ui::WaveformView::ClipFade;
+        // Two-chop buffer at original length 5.0s. Cut at 2.0s.
+        // Each clip has a real fade-in and a real fade-out. The
+        // user trims to [1.0, 4.5] — the cut survives, so the two
+        // resulting clips should keep their original fade-ins and
+        // fade-outs verbatim on the preserved boundaries. Only the
+        // last clip's fade-out should be dropped (its original
+        // right boundary was chopped).
+        const std::vector<double> oldCuts = { 2.0 };
+        const std::vector<Fade> oldFades = {
+            { /*fadeIn*/ 0.5, /*fadeOut*/ 0.3 },
+            { /*fadeIn*/ 0.2, /*fadeOut*/ 0.4 },
+        };
+        const double oldLength = 5.0;
+        const double trimStart = 1.0;
+        const double trimEnd   = 4.5;
+        // The shift of the surviving cut: 2.0 - 1.0 = 1.0.
+        const std::vector<double> clampedCuts = { 1.0 };
+
+        const auto newFades = spawn::waveform::rebuildClipFadesAfterTrim(
+            oldCuts, oldLength, oldFades,
+            trimStart, trimEnd, clampedCuts);
+
+        expectEquals(static_cast<int>(newFades.size()), 2);
+        // First new clip is the trimmed left half of original clip 0.
+        // fadeIn from original clip 0 (0.5); fadeOut preserved from
+        // original clip 0 (0.3), not from clip 1's fadeOut (0.4).
+        expectEquals(newFades[0].fadeInSeconds,  0.5);
+        expectEquals(newFades[0].fadeOutSeconds, 0.3);
+        // Second new clip is the trimmed right half of original
+        // clip 1. fadeIn from original clip 1 (0.2). fadeOut is
+        // dropped because the trim cut the clip's right edge.
+        expectEquals(newFades[1].fadeInSeconds,  0.2);
+        expectEquals(newFades[1].fadeOutSeconds, 0.0);
+
+        // No-op trim (start == end of full buffer). Every fade,
+        // including the last chop's fade-out, survives because
+        // every anchor is still on the buffer.
+        {
+            const std::vector<Fade> all = {
+                { 0.1, 0.2 }, { 0.3, 0.4 }, { 0.5, 0.6 },
+            };
+            const auto noTrim = spawn::waveform::rebuildClipFadesAfterTrim(
+                std::vector<double>{ 2.0, 6.0 }, 8.0, all,
+                0.0, 8.0, std::vector<double>{ 2.0, 6.0 });
+            expectEquals(static_cast<int>(noTrim.size()), 3);
+            expectEquals(noTrim[0].fadeInSeconds,  0.1);
+            expectEquals(noTrim[0].fadeOutSeconds, 0.2);
+            expectEquals(noTrim[1].fadeInSeconds,  0.3);
+            expectEquals(noTrim[1].fadeOutSeconds, 0.4);
+            expectEquals(noTrim[2].fadeInSeconds,  0.5);
+            expectEquals(noTrim[2].fadeOutSeconds, 0.6);
+        }
+
+        // Trim that leaves the buffer tail intact: trimEnd falls
+        // exactly on a surviving cut at the buffer tail, so the
+        // last original clip's fade-out anchor is still on the
+        // new buffer. The last new clip's fade-out survives.
+        {
+            const std::vector<Fade> two = {
+                { 0.5, 0.0 }, { 0.0, 0.4 },
+            };
+            const auto atTail = spawn::waveform::rebuildClipFadesAfterTrim(
+                std::vector<double>{ 3.0 }, 5.0, two,
+                1.0, 5.0, std::vector<double>{ 2.0 });
+            expectEquals(static_cast<int>(atTail.size()), 2);
+            expectEquals(atTail[0].fadeInSeconds,  0.5);
+            expectEquals(atTail[0].fadeOutSeconds, 0.0);
+            expectEquals(atTail[1].fadeInSeconds,  0.0);
+            expectEquals(atTail[1].fadeOutSeconds, 0.4);
+        }
+
+        // Trim that cuts the buffer tail mid-clip (trimEnd
+        // strictly inside an original clip): the original
+        // fade-out anchor at oldLength is now off-buffer, so
+        // the last new clip's fade-out is dropped.
+        {
+            const std::vector<Fade> two = {
+                { 0.5, 0.0 }, { 0.0, 0.4 },
+            };
+            const auto tailCut = spawn::waveform::rebuildClipFadesAfterTrim(
+                std::vector<double>{ 3.0 }, 5.0, two,
+                1.0, 4.5, std::vector<double>{ 2.0 });
+            expectEquals(static_cast<int>(tailCut.size()), 2);
+            expectEquals(tailCut[0].fadeInSeconds,  0.5);
+            expectEquals(tailCut[0].fadeOutSeconds, 0.0);
+            expectEquals(tailCut[1].fadeInSeconds,  0.0);
+            expectEquals(tailCut[1].fadeOutSeconds, 0.0);
+        }
+    }
+};
+
 static WaveformViewCutTests waveformViewCutTests;
 static WaveformViewSelectionUpdateTests waveformViewSelectionUpdateTests;
 static WaveformViewChopDragDuringPlaybackRegression
     waveformViewChopDragDuringPlaybackRegression;
 static WaveformViewClipFadeTests waveformViewClipFadeTests;
+static ClipFadeRemapTests clipFadeRemapTests;
 

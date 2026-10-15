@@ -104,6 +104,7 @@ if(SPAWN_BUILD_STANDALONE)
             src/ui/knob/Knob.cpp
             src/ui/lookandfeel/Palette.cpp
             src/ui/lookandfeel/SpawnLookAndFeel.cpp
+            src/waveform/ClipFadeRemap.cpp
             src/waveform/WaveformView.cpp)
 
     target_compile_definitions(SpawnStandalone
@@ -154,6 +155,7 @@ if(SPAWN_BUILD_TESTS)
             src/ui/icons/Icon.cpp
             src/ui/icons/Icons.cpp
             src/ui/lookandfeel/Palette.cpp
+            src/waveform/ClipFadeRemap.cpp
             src/waveform/WaveformView.cpp)
 
     target_link_libraries(SpawnTests
