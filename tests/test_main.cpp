@@ -49,3 +49,4 @@ int main(int /*argc*/, char* /*argv*/[])
     std::cout << "All tests passed.\n";
     return 0;
 }
+

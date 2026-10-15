@@ -34,6 +34,8 @@ public:
         Dice5,
         XLine,
         Lock,
+        ChevronLeft,
+        ChevronRight,
     };
 
     // Parse and cache the icon at the requested pixel size.

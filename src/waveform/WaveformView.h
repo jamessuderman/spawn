@@ -35,6 +35,7 @@
 
 #include <JuceHeader.h>
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -197,6 +198,36 @@ public:
     void setClipLocks(std::vector<bool> newLocks);
     bool isClipLocked(int clipIndex) const;
 
+    // Clip fades: per-clip (fadeInSeconds, fadeOutSeconds) pair vector
+    // the same length as the chop list (one entry per clip). A 0.0
+    // value means "no fade on this side". Fades are positional — they
+    // refer to the output position of a clip in the current chop list,
+    // not to the clip's content. When the user adds or removes a cut,
+    // the fades vector resizes to match; on a merge the left clip's
+    // fade-in and the right clip's fade-out survive into the merged
+    // pair.
+    //
+    // The fades vector's size is kept in lockstep with the chop list
+    // in syncLockVectorSize() (renamed conceptually; still default-
+    // constructed `(0, 0)` for new clips and dropped on a fresh file
+    // load). Setter clamps each value to [0, clipLength] so a stray
+    // drag never produces a negative or sub-clip fade.
+    struct ClipFade {
+        double fadeInSeconds  = 0.0;
+        double fadeOutSeconds = 0.0;
+    };
+    std::vector<ClipFade> getClipFades() const;
+    void setClipFades(std::vector<ClipFade> newFades);
+    void setClipFadeIn(int clipIndex, double seconds);
+    void setClipFadeOut(int clipIndex, double seconds);
+    bool isClipFaded(int clipIndex) const;
+
+    // Fires whenever a clip's fade is mutated by the user. Optional —
+    // the host can wire this to drive the preview engine's gain
+    // envelope without polling. Always fires after the model is in a
+    // consistent state.
+    std::function<void()> onClipFadesChanged;
+
     // Add a cut at `seconds`, clamped to (0, length). Inserted into
     // the sorted list; if a cut already exists within kMinChopGapSeconds
     // the call is a no-op (so a user clicking rapidly on the same spot
@@ -232,6 +263,16 @@ public:
     // [0, length] the closest chop is returned and the result is
     // treated as empty (start == end → caller should skip play).
     void findChopAt(double seconds, double& outStart, double& outEnd) const;
+
+    // Resolve the clip index that contains `seconds`. The chop
+    // list is bounded by [startSeconds, endSeconds] with cuts as
+    // internal boundaries, so a clip is the half-open interval
+    // [prevCut, nextCut) where prevCut and nextCut are picked
+    // from {startSeconds, cuts[], endSeconds}. Returns -1 when
+    // `seconds` is outside the active region or the sample is
+    // empty. Used by the Speaker click path to look up the
+    // per-clip fade lengths before calling playFrom().
+    int findClipIndexAt(double seconds) const;
 
     // Resolve the chop that begins at or after `seconds` (sample time)
     // into its [outStart, outEnd] bounds. Used after a Scissors cut at
@@ -289,8 +330,22 @@ public:
     // other cuts, endSeconds, length). Public so tests can drive the
     // chop-drag code paths directly (mouse events are awkward to
     // synthesise in unit tests).
-    enum class DragTarget { None, Start, End, Pan, Cut };
+    enum class DragTarget { None, Start, End, Pan, Cut, FadeIn, FadeOut };
     void applyMarkerDrag(DragTarget target, int x, juce::Rectangle<int> bounds);
+    // Apply a fade drag (FadeIn or FadeOut) to the clip at
+    // `clipIndex`. The drag x maps to a fade length in seconds,
+    // clamped to the clip's own length so a fade can never exceed
+    // the clip itself. Public so tests can drive the fade drag
+    // code paths directly.
+    void applyFadeDrag(DragTarget target, int clipIndex, int x,
+                       juce::Rectangle<int> bounds);
+    // Hit-test helpers. Public so tests can drive the per-element
+    // hit zones (lock, fade) without synthesising mouse events.
+    // Each returns -1 on a miss; hitTestMarker additionally
+    // returns the cut index for DragTarget::Cut results.
+    DragTarget hitTestMarker(int x, juce::Rectangle<int> bounds,
+                             int& outCutIndex) const;
+    int hitTestClipLock(int x, int y, juce::Rectangle<int> bounds) const;
 
     // Mouse — chop-marker drag, pan, and double-click reset on Main only.
     void mouseMove(const juce::MouseEvent& e) override;
@@ -347,6 +402,13 @@ private:
     // syncLockVectorSize().
     std::vector<bool> clipLocks;
 
+    // Per-clip (fadeIn, fadeOut) pairs. Same size semantics as
+    // clipLocks — exactly cuts.size() + 1 entries. New clips default
+    // to (0, 0); on a merge (cut removed) the surviving entry takes
+    // left.fadeIn and right.fadeOut from the pre-merge state. See
+    // syncLockVectorSize() for the size-keeping helper.
+    std::vector<ClipFade> clipFades;
+
     // Selected clip [start, end], in seconds. start == end means
     // "no selection" (the view's initial state, before any file is
     // loaded). After a load, the only chop is [0, length], which is
@@ -371,6 +433,13 @@ private:
     // the new position would land in a different slot we erase +
     // reinsert and update the index to track the new slot.
     int activeCutIndex = -1;
+    // Index into `clipFades` for an in-progress FadeIn / FadeOut
+    // drag. Unused when activeDrag isn't FadeIn/FadeOut. The clip
+    // index is captured at mouseDown and held until mouseUp — a
+    // cut insert/remove during a fade drag would be unusual, but
+    // if it happens the drag stops making sense and we just commit
+    // whatever the last valid fade length was.
+    int activeFadeClipIndex = -1;
     // True once the press has moved past the click/click-to-play slack and
     // the gesture is committed to being a drag. Until then, mouseUp starts
     // preview playback. Main only.
@@ -448,6 +517,14 @@ private:
     // shown over the marker lines so the user sees they can drag start/end.
     std::unique_ptr<juce::MouseCursor> grabCursor;
 
+    // Per-side fade cursors. ChevronRight over a clip's top-left
+    // corner signals "drag right to grow the fade-in"; ChevronLeft
+    // over a clip's top-right corner signals "drag left to grow
+    // the fade-out". The chevrons point in the direction the user
+    // has to drag, so the affordance matches the gesture.
+    std::unique_ptr<juce::MouseCursor> fadeInCursor;
+    std::unique_ptr<juce::MouseCursor> fadeOutCursor;
+
     void drawBackground(juce::Graphics& g, juce::Rectangle<int> bounds) const;
     void drawBorder(juce::Graphics& g, juce::Rectangle<int> bounds) const;
     void drawPlaceholder(juce::Graphics& g, juce::Rectangle<int> bounds) const;
@@ -471,6 +548,17 @@ private:
                        juce::Rectangle<int> bounds,
                        double visStart,
                        double visEnd);
+
+    // Draws per-clip fade-in / fade-out overlays. A fade-in shows as
+    // a diagonal line from the top-left corner of the clip to the
+    // baseline at x = clipLeft + fadeInSeconds; fade-out mirrors
+    // from the top-right corner. Drawn in labelText() at 60% alpha
+    // on top of the waveform fill so the fade is visible against
+    // the ember + muted backdrop.
+    void drawClipFades(juce::Graphics& g,
+                       juce::Rectangle<int> bounds,
+                       double visStart,
+                       double visEnd) const;
 
     // Draws the playhead if previewEngine != nullptr and isPlaying() is
     // true. 1 px vertical line in palette().playhead() colour.
@@ -496,19 +584,21 @@ private:
     int    secondsToX(double t, juce::Rectangle<int> bounds,
                       bool unclamped = false) const;
 
-    // Returns which marker (if any) is under the mouse position. Main only.
-    // When the result is DragTarget::Cut, `outCutIndex` is set to the
-    // index into `cuts` of the cut that was hit; for other results it
-    // is left at -1. The out-param keeps `hitTestMarker` const so
-    // `mouseMove`'s hover path can call it without a `mutable` escape.
-    DragTarget hitTestMarker(int x, juce::Rectangle<int> bounds,
-                             int& outCutIndex) const;
-
-    // Returns the index of the clip whose lock icon (if any) is under
-    // the mouse position, or -1 if no lock icon is at that point.
-    // The hit zone matches the drawn icon's bounding rect plus a
-    // 2 px hit-target margin so the lock is easy to click.
-    int hitTestClipLock(int x, int y, juce::Rectangle<int> bounds) const;
+    // Returns whether a clip-fade handle is under the mouse position
+    // and which one: clip index + FadeIn (top-left corner) or
+    // FadeOut (top-right corner). Returns { -1, None } on a miss.
+    // The hit zone is the top-left / top-right corner square of the
+    // clip's slice in the active region — `kFadeHitSize` px on each
+    // side, inset from the slice edges so the marker-line drag
+    // (Start/End/Cut) still wins when the pointer is on the line.
+    // Public-equivalent visibility so tests can drive the fade drag
+    // directly.
+    struct FadeHandleHit {
+        int        clipIndex = -1;
+        DragTarget side      = DragTarget::None;
+    };
+    FadeHandleHit hitTestFadeHandle(int x, int y,
+                                    juce::Rectangle<int> bounds) const;
 
     // Update startSeconds / endSeconds from a marker drag, with min-gap
     // enforcement against the active region's other edge. Cut drags
@@ -536,11 +626,32 @@ private:
     // switched the AudioThumbnail's source.
     void resetForNewSource();
 
-    // Resize clipLocks so it has exactly cuts.size() + 1 entries
-    // (one flag per clip). New entries default to false (unlocked);
-    // trailing entries drop when the chop list shrinks. Called
-    // from every path that mutates cuts.
+    // Resize clipLocks and clipFades so each has exactly
+    // cuts.size() + 1 entries (one slot per clip). New entries
+    // default to false / (0, 0); trailing entries drop when the
+    // chop list shrinks. Called from every path that mutates cuts.
     void syncLockVectorSize();
+
+public:
+    // Hit-zone size for the fade handle corner, in pixels. The
+    // top-left / top-right corner of each clip's slice is the
+    // default size; when a fade is present the handle follows the
+    // top of the fade line and uses the same generous radius. The
+    // hit zone is bigger than the visual chevron so the user has
+    // a forgiving target — fade handles are easy to miss at
+    // small zoom levels otherwise.
+    static constexpr int kFadeHitSize = 16;
+
+private:
+    // Returns the left and right x boundaries of the slice for
+    // `clipIndex`, in pixel space, intersected with the visible
+    // window. Used by both drawClipFades and hitTestFadeHandle.
+    // Returns a rectangle with width 0 when the clip is fully
+    // outside the visible window.
+    juce::Rectangle<int> clipSlicePixels(int clipIndex,
+                                         juce::Rectangle<int> bounds,
+                                         double visStart,
+                                         double visEnd) const;
 };
 
 } // namespace spawn::ui

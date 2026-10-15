@@ -33,6 +33,46 @@ namespace
     constexpr int kOuterPaddingX = 16; // margin to the left/right edges
     constexpr int kOuterPaddingY = 16; // tight top margin around the control header
     constexpr int kGap = 4;
+
+    // Resolve the original clip index (in the model's chop list)
+    // that contains the given time `t` in pre-trim coordinates.
+    // Returns -1 if `t` is outside the original [0, length] range.
+    // The original chop list is `[0, oldCuts[0], ..., oldCuts[N],
+    // length]`, so the original clip j spans
+    // `[oldCuts[j-1], oldCuts[j]]` (with sentinel boundaries at
+    // 0 and length). For t on a boundary, the clip on the right
+    // side wins — that's the clip the user's fade is "anchored
+    // to" when t lines up with a chop boundary. Used by both
+    // trimOutsideMarkers() and shuffleChops() to map a position
+    // in the new buffer back to the original clip it came from.
+    int originalClipIndexContaining(double t,
+                                    const std::vector<double>& oldCuts,
+                                    double oldLength)
+    {
+        if (oldLength <= 0.0)
+            return -1;
+        if (t < 0.0 || t > oldLength)
+            return -1;
+        if (t == oldLength)
+            return static_cast<int>(oldCuts.size()); // last clip
+        // Binary-search for the first oldCut >= t. If t is
+        // exactly at that cut, the right-side clip owns the
+        // boundary. If t is strictly inside, the cut is the
+        // right boundary of the containing clip.
+        auto it = std::lower_bound(oldCuts.begin(),
+                                   oldCuts.end(), t);
+        if (it == oldCuts.end())
+        {
+            // t is past the last cut but before oldLength — last
+            // clip (the case t == oldLength is handled above).
+            return static_cast<int>(oldCuts.size());
+        }
+        const std::size_t idx = static_cast<std::size_t>(
+            it - oldCuts.begin());
+        if (*it == t)
+            return static_cast<int>(idx + 1); // right-side clip
+        return static_cast<int>(idx);          // clip containing t
+    }
 } // namespace
 
 namespace
@@ -619,6 +659,23 @@ namespace
                 // No confirm dialog (per James's call — silent, immediate).
                 // No-op when no file is loaded, when the chop region is
                 // empty, or when the engine's buffer is empty.
+                // Resolve the original clip index (in the model's chop
+                // list) that contains the given time `t` in the
+                // pre-trim coordinates. Returns -1 if `t` is outside
+                // the original [0, length] range. The original chop
+                // list is `[0, oldCuts[0], oldCuts[1], ..., oldCuts[N],
+                // length]`, so the original clip j spans
+                // `[oldCuts[j-1], oldCuts[j]]` (with sentinel
+                // boundaries at 0 and length). For t at the boundary,
+                // the clip on the right side wins — that's the clip
+                // the user's fade is "anchored to" when t lines up
+                // with a chop boundary.
+                // (See the free function originalClipIndexContaining
+                // in the anonymous namespace at the top of this
+                // file — it's pulled out so it can be reused by
+                // shuffleChops() below without duplicating the
+                // binary-search logic.)
+
                 void trimOutsideMarkers()
                 {
                     if (waveformView == nullptr)
@@ -628,11 +685,27 @@ namespace
                     if (!engine.isPlaying() && !engine.hasBuffer())
                         return;
 
-                    // 1) Snapshot the cuts BEFORE we ask the view to reload
-                    //    (reloadFromBuffer clears the cuts).
+                    // 1) Snapshot cuts, locks, and fades BEFORE we ask
+                    //    the view to reload (reloadFromBuffer clears
+                    //    every per-clip state vector via
+                    //    resetForNewSource). The trim is supposed to
+                    //    preserve the user's edits — chops, locks,
+                    //    and fades all carry over to the trimmed
+                    //    buffer, with cuts shifted by -trimStart and
+                    //    fades re-mapped onto the new clip list. Cuts
+                    //    and locks were already preserved by previous
+                    //    work; fades were dropped on every trim, so
+                    //    we restore them here.
                     const double trimStart = waveformView->getStartSeconds();
                     const double trimEnd = waveformView->getEndSeconds();
+                    const double oldLength = engine.getBufferSnapshot() != nullptr
+                        ? engine.getBufferSnapshot()->getNumSamples()
+                            / engine.getSourceSampleRate()
+                        : trimEnd;
                     std::vector<double> oldCuts = waveformView->getCuts();
+                    std::vector<bool>      oldLocks = waveformView->getClipLocks();
+                    std::vector<spawn::ui::WaveformView::ClipFade> oldFades =
+                        waveformView->getClipFades();
 
                     // 2) Trim the engine's buffer in-place. The engine
                     //    stops playback and parks the playhead at 0.
@@ -680,6 +753,85 @@ namespace
                         clamped.push_back(rel);
                     }
                     waveformView->setCuts(std::move(clamped));
+
+                    // 5) Re-map locks onto the new clip list. Locks
+                    //    are positional, so each surviving clip index
+                    //    keeps the same lock state as its original
+                    //    counterpart. We need to figure out the
+                    //    original clip index for each new clip.
+                    //    (oldLocks has size = oldCuts.size() + 1, one
+                    //    per original clip; new clip count = clamped.size() + 1.)
+                    std::vector<bool> newLocks;
+                    newLocks.reserve(clamped.size() + 1);
+                    for (int newIdx = 0; newIdx <= static_cast<int>(clamped.size()); ++newIdx)
+                    {
+                        const double newLeftSec = (newIdx == 0)
+                            ? 0.0 : clamped[newIdx - 1];
+                        const double newRightSec = (newIdx == static_cast<int>(clamped.size()))
+                            ? newLength : clamped[newIdx];
+                        // Map back to original coordinates and find
+                        // the original clip index containing the new
+                        // clip's left edge — that clip's lock state
+                        // is the best representative for the new clip.
+                        const double origLeft = newLeftSec + trimStart;
+                        const int origClip = originalClipIndexContaining(
+                            origLeft, oldCuts, oldLength);
+                        if (origClip >= 0
+                            && origClip < static_cast<int>(oldLocks.size()))
+                            newLocks.push_back(oldLocks[origClip]);
+                        else
+                            newLocks.push_back(false);
+                        (void) newRightSec; // unused; left-edge wins for locks
+                    }
+                    waveformView->setClipLocks(std::move(newLocks));
+
+                    // 6) Re-map fades onto the new clip list. For
+                    //    each new clip, the fade-in comes from the
+                    //    original clip that contained the new clip's
+                    //    left edge, and the fade-out from the
+                    //    original clip that contained the new clip's
+                    //    right edge. Clips fully inside the trim
+                    //    region (i.e. middle clips whose right edge
+                    //    is at a surviving cut) keep their fades
+                    //    verbatim. The LAST new clip's fade-out is
+                    //    dropped: its original right boundary was
+                    //    past trimEnd and got cut, so the original
+                    //    fadeOut's right anchor is now past the
+                    //    buffer — the handle would be unreachable
+                    //    and the fade audio would only play partway.
+                    //    The user can re-add the fade-out if they
+                    //    still want one.
+                    const int numNewClips = static_cast<int>(clamped.size()) + 1;
+                    std::vector<spawn::ui::WaveformView::ClipFade> newFades;
+                    newFades.reserve(clamped.size() + 1);
+                    for (int newIdx = 0; newIdx < numNewClips; ++newIdx)
+                    {
+                        const double newLeftSec = (newIdx == 0)
+                            ? 0.0 : clamped[newIdx - 1];
+                        const double newRightSec = (newIdx == numNewClips - 1)
+                            ? newLength : clamped[newIdx];
+                        const double origLeft = newLeftSec + trimStart;
+                        const double origRight = newRightSec + trimStart;
+                        const bool isLastClip = (newIdx == numNewClips - 1);
+                        spawn::ui::WaveformView::ClipFade fade{};
+                        const int inClip = originalClipIndexContaining(
+                            origLeft, oldCuts, oldLength);
+                        const int outClip = originalClipIndexContaining(
+                            origRight, oldCuts, oldLength);
+                        if (inClip >= 0
+                            && inClip < static_cast<int>(oldFades.size()))
+                            fade.fadeInSeconds = oldFades[inClip].fadeInSeconds;
+                        // Preserve the fade-out only for non-last
+                        // clips. The last clip's right edge was cut
+                        // by the trim and its original fadeOut's
+                        // anchor is now off-buffer.
+                        if (!isLastClip
+                            && outClip >= 0
+                            && outClip < static_cast<int>(oldFades.size()))
+                            fade.fadeOutSeconds = oldFades[outClip].fadeOutSeconds;
+                        newFades.push_back(fade);
+                    }
+                    waveformView->setClipFades(std::move(newFades));
                 }
 
                 // Shuffle the chops in the active region into a new random order
@@ -763,6 +915,13 @@ namespace
                     // unlocked original clips.
                     const std::vector<bool> clipLocks =
                         waveformView->getClipLocks();
+                    // Fades are content-addressed: they belong to the
+                    // audio, not to a position. After shuffle, the
+                    // new clip at position i came from the original
+                    // clip at shuffleSrcIdx[i], so its fades come
+                    // from oldFades[shuffleSrcIdx[i]].
+                    const std::vector<spawn::ui::WaveformView::ClipFade> oldFades =
+                        waveformView->getClipFades();
 
                     // If clipLocks.size() doesn't match the chop count
                     // (e.g. the view was setCuts'd externally and the
@@ -799,7 +958,9 @@ namespace
                     //   - else: take the next free clip from the
                     //     shuffled unlockedPool.
                     std::vector<std::pair<double, double>> shuffledWindows;
+                    std::vector<int>                    shuffleSrcIdx; // tracks which original clip landed at each output position
                     shuffledWindows.reserve(originalOrder.size());
+                    shuffleSrcIdx.reserve(originalOrder.size());
                     size_t poolCursor = 0;
                     for (size_t i = 0; i < originalOrder.size(); ++i)
                     {
@@ -808,6 +969,7 @@ namespace
                             ? static_cast<int>(i)
                             : unlockedPool[poolCursor++];
                         shuffledWindows.push_back(originalOrder[srcIdx]);
+                        shuffleSrcIdx.push_back(srcIdx);
                     }
 
                     // Build the new cuts list for the view. The new
@@ -848,6 +1010,26 @@ namespace
                     // is still correct after shuffle — setClipLocks
                     // restores them at the new clip positions.
                     waveformView->setClipLocks(clipLocks);
+                    // Fades follow the audio content, not the
+                    // position. The new clip at position i came from
+                    // the original clip at shuffleSrcIdx[i], so
+                    // its fades are oldFades[shuffleSrcIdx[i]]. A
+                    // locked position kept its original clip, so
+                    // the fade is preserved verbatim; an unlocked
+                    // position pulled from the pool inherits that
+                    // pool entry's fade.
+                    std::vector<spawn::ui::WaveformView::ClipFade> newFades;
+                    newFades.reserve(shuffleSrcIdx.size());
+                    for (size_t i = 0; i < shuffleSrcIdx.size(); ++i)
+                    {
+                        const int src = shuffleSrcIdx[i];
+                        if (src >= 0
+                            && src < static_cast<int>(oldFades.size()))
+                            newFades.push_back(oldFades[src]);
+                        else
+                            newFades.push_back(spawn::ui::WaveformView::ClipFade{});
+                    }
+                    waveformView->setClipFades(std::move(newFades));
                 }
 
                 // Clear every internal cut boundary in the active region. The

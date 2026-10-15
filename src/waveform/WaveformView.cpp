@@ -80,6 +80,26 @@ std::unique_ptr<juce::MouseCursor> makeIconCursor(Icons::Id id,
                                                kCursorPx / 2);
 }
 
+// Smaller variant for affordances that sit in a small hit zone
+// (the per-clip fade handle is 8×8 px; a 24×24 cursor would
+// visually overlap adjacent regions). The icon is rendered into
+// a square of `size` pixels with the hot-spot at the centre.
+std::unique_ptr<juce::MouseCursor> makeSmallIconCursor(Icons::Id id,
+                                                       juce::Colour tint,
+                                                       int size)
+{
+    juce::Image img(juce::Image::ARGB, size, size, true);
+    {
+        juce::Graphics g(img);
+        Icons::draw(g, id,
+                    juce::Rectangle<float>(0.0f, 0.0f,
+                                           static_cast<float>(size),
+                                           static_cast<float>(size)),
+                    tint);
+    }
+    return std::make_unique<juce::MouseCursor>(img, size / 2, size / 2);
+}
+
 } // namespace
 
 WaveformView::WaveformView(Palette& paletteRef, Mode modeToUse)
@@ -103,7 +123,18 @@ WaveformView::WaveformView(Palette& paletteRef, Mode modeToUse)
     // juce::Image, so we render each icon into its own 24×24 ARGB image with
     // the hot-spot at the centre so cursor placement lines up with whatever
     // the user is grabbing.
-    grabCursor = makeIconCursor(Icons::Id::UnfoldHorizontal, palette.labelText());
+    grabCursor  = makeIconCursor(Icons::Id::UnfoldHorizontal, palette.labelText());
+    // Per-side fade cursors, rendered at 16×16 so the cursor doesn't
+    // visually overlap adjacent clip regions when sitting in the 8×8
+    // fade hit zone. ChevronRight over the top-left corner (fade-in
+    // handle) signals "drag right to grow the fade"; ChevronLeft over
+    // the top-right corner (fade-out handle) signals "drag left to
+    // grow the fade". The chevron points in the direction the user
+    // has to drag, so the affordance matches the gesture.
+    fadeInCursor  = makeSmallIconCursor(Icons::Id::ChevronRight,
+                                        palette.labelText(), 16);
+    fadeOutCursor = makeSmallIconCursor(Icons::Id::ChevronLeft,
+                                        palette.labelText(), 16);
 }
 
 WaveformView::~WaveformView()
@@ -269,6 +300,11 @@ void WaveformView::resetForNewSource()
     // buffer means the lock pattern no longer maps to anything. Reset
     // to a single unlocked clip spanning the new full sample.
     clipLocks.clear();
+    // Fades are positional too — a new buffer means the fade pattern
+    // no longer maps to anything. Reset to a single (0, 0) clip
+    // spanning the new full sample. syncLockVectorSize() below would
+    // re-default this, but clearing first keeps the model explicit.
+    clipFades.clear();
     selectedClipStart = 0.0;
     selectedClipEnd   = length;
     if (partner != nullptr)
@@ -397,6 +433,13 @@ void WaveformView::setClipLocks(std::vector<bool> newLocks)
     // clamp to the actual clip count.
     clipLocks = std::move(newLocks);
     syncLockVectorSize();
+    // Lock icons draw in the lock hit-test zone (top-right of each
+    // clip slice). If we don't repaint here, the lock icon state
+    // stays visually stale until the next setCuts/setClipFades
+    // call. A standalone lock toggle on the message thread (e.g.
+    // a future "lock all" button) would otherwise appear not to
+    // take effect until something else triggered a repaint.
+    repaint();
 }
 
 bool WaveformView::isClipLocked(int clipIndex) const
@@ -407,16 +450,88 @@ bool WaveformView::isClipLocked(int clipIndex) const
     return clipLocks[clipIndex];
 }
 
+std::vector<WaveformView::ClipFade> WaveformView::getClipFades() const
+{
+    return clipFades;
+}
+
+void WaveformView::setClipFades(std::vector<ClipFade> newFades)
+{
+    // Caller is responsible for matching size to the chop list —
+    // syncLockVectorSize() runs after to clamp to the actual clip
+    // count. Extra entries drop; missing entries fill with (0, 0).
+    clipFades = std::move(newFades);
+    syncLockVectorSize();
+    if (onClipFadesChanged != nullptr)
+        onClipFadesChanged();
+    repaint();
+}
+
+void WaveformView::setClipFadeIn(int clipIndex, double seconds)
+{
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(clipFades.size()))
+        return;
+    // Clamp to non-negative; the "can't exceed clip length" rule is
+    // enforced per-clip below using the resolved slice.
+    const double requested = std::max(0.0, seconds);
+    // Find the clip's slice to derive its length.
+    double prev = startSeconds;
+    for (int i = 0; i < clipIndex; ++i)
+        prev = cuts[i];
+    const double next = (clipIndex < static_cast<int>(cuts.size()))
+        ? cuts[clipIndex]
+        : endSeconds;
+    const double clipLen = std::max(0.0, next - prev);
+    clipFades[clipIndex].fadeInSeconds =
+        std::min(requested, clipLen);
+    if (onClipFadesChanged != nullptr)
+        onClipFadesChanged();
+    repaint();
+}
+
+void WaveformView::setClipFadeOut(int clipIndex, double seconds)
+{
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(clipFades.size()))
+        return;
+    const double requested = std::max(0.0, seconds);
+    double prev = startSeconds;
+    for (int i = 0; i < clipIndex; ++i)
+        prev = cuts[i];
+    const double next = (clipIndex < static_cast<int>(cuts.size()))
+        ? cuts[clipIndex]
+        : endSeconds;
+    const double clipLen = std::max(0.0, next - prev);
+    clipFades[clipIndex].fadeOutSeconds =
+        std::min(requested, clipLen);
+    if (onClipFadesChanged != nullptr)
+        onClipFadesChanged();
+    repaint();
+}
+
+bool WaveformView::isClipFaded(int clipIndex) const
+{
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(clipFades.size()))
+        return false;
+    return clipFades[clipIndex].fadeInSeconds > 0.0
+        || clipFades[clipIndex].fadeOutSeconds > 0.0;
+}
+
 void WaveformView::syncLockVectorSize()
 {
-    // Lock vector must have exactly cuts.size() + 1 entries — one
-    // flag per clip defined by the chop list. Grow with false (new
-    // clips default unlocked); shrink by dropping trailing entries.
+    // Per-clip state vectors must each have exactly cuts.size() + 1
+    // entries — one slot per clip defined by the chop list. Grow
+    // with default values (unlocked / no fades); shrink by dropping
+    // trailing entries.
     const int desired = static_cast<int>(cuts.size()) + 1;
     if (static_cast<int>(clipLocks.size()) < desired)
         clipLocks.resize(desired, false);
     else if (static_cast<int>(clipLocks.size()) > desired)
         clipLocks.resize(desired);
+
+    if (static_cast<int>(clipFades.size()) < desired)
+        clipFades.resize(desired, ClipFade{});
+    else if (static_cast<int>(clipFades.size()) > desired)
+        clipFades.resize(desired);
 }
 
 void WaveformView::clearCuts()
@@ -516,7 +631,23 @@ bool WaveformView::removeCut(int index)
     // Removing a cut merges two clips into one. Drop the lock of the
     // cut that just got absorbed (it's the left neighbour of the
     // merge); other locks at positions that still exist survive.
-    syncLockVectorSize();
+    // For fades, the left clip's fade-in survives into the merged
+    // pair, and the right clip's fade-out survives — same model as
+    // locks: each clip's "outgoing" state stays, "incoming" state
+    // from the absorbed side drops. We snapshot the right clip's
+    // fade-out *before* syncLockVectorSize() shrinks the vector so
+    // we can write it back to the surviving (left) entry.
+    if (index + 1 < static_cast<int>(clipFades.size()))
+    {
+        const double rightFadeOut = clipFades[index + 1].fadeOutSeconds;
+        syncLockVectorSize();
+        if (index < static_cast<int>(clipFades.size()))
+            clipFades[index].fadeOutSeconds = rightFadeOut;
+    }
+    else
+    {
+        syncLockVectorSize();
+    }
 
     // Selection update: when the removed cut was the left edge of
     // the selected clip, the chop to the left of the removed cut
@@ -625,6 +756,51 @@ void WaveformView::findChopAt(double seconds,
 
     outEnd   = bounds[idxRight];
     outStart = (idxRight > 0) ? bounds[idxRight - 1] : bounds[0];
+}
+
+int WaveformView::findClipIndexAt(double seconds) const
+{
+    // Mirror findChopAt's slice assembly (0, startSeconds if > 0,
+    // every cut, endSeconds if < length, length) and return the
+    // index of the slice that contains `seconds`. -1 when the
+    // sample is empty or `seconds` is outside the active region.
+    // The clipFades array is the same length as cuts.size() + 1,
+    // so the returned index is also the right index into
+    // clipFades.
+    const double length = thumbnail.getTotalLength();
+    if (length <= 0.0)
+        return -1;
+    const double t = juce::jlimit(0.0, length, seconds);
+
+    std::vector<double> bounds;
+    bounds.reserve(cuts.size() + 4);
+    bounds.push_back(0.0);
+    if (startSeconds > 0.0)         bounds.push_back(startSeconds);
+    for (const double c : cuts)     bounds.push_back(c);
+    if (endSeconds < length)        bounds.push_back(endSeconds);
+    bounds.push_back(length);
+    int n = static_cast<int>(bounds.size());
+
+    for (int i = 1; i < n; /* advances */)
+    {
+        if (std::abs(bounds[i] - bounds[i - 1]) < kMinChopGapSeconds)
+        {
+            for (int j = i; j < n - 1; ++j)
+                bounds[j] = bounds[j + 1];
+            --n;
+        }
+        else
+        {
+            ++i;
+        }
+    }
+
+    for (int idx = 0; idx + 1 < n; ++idx)
+    {
+        if (t >= bounds[idx] && t < bounds[idx + 1])
+            return idx;
+    }
+    return -1;
 }
 
 void WaveformView::findChopRightOf(double seconds,
@@ -893,9 +1069,30 @@ void WaveformView::mouseMove(const juce::MouseEvent& e)
     // change is needed to advertise it.) Cuts use the same grab
     // cursor as Start/End, so the cursor matches the affordance on
     // every draggable boundary.
+    //
+    // Fade handles take precedence over marker lines for cursor
+    // selection — the corner of a clip is visually a fade handle,
+    // not a marker, so the chevron cursor wins when both are
+    // possible. The cursor is per-side: ChevronRight over a top-
+    // left corner (fade-in, drag right to grow), ChevronLeft over
+    // a top-right corner (fade-out, drag left to grow). The
+    // chevron points in the direction the user has to drag.
+    const auto fadeHit = hitTestFadeHandle(e.x, e.y, bounds);
     int cutIdx = -1;
     const auto hit = hitTestMarker(e.x, bounds, cutIdx);
-    if (hit == DragTarget::None)
+    if (fadeHit.clipIndex >= 0
+        && fadeHit.side == DragTarget::FadeIn
+        && fadeInCursor != nullptr)
+    {
+        setMouseCursor(*fadeInCursor);
+    }
+    else if (fadeHit.clipIndex >= 0
+             && fadeHit.side == DragTarget::FadeOut
+             && fadeOutCursor != nullptr)
+    {
+        setMouseCursor(*fadeOutCursor);
+    }
+    else if (hit == DragTarget::None)
         setMouseCursor(juce::MouseCursor::NormalCursor);
     else if (grabCursor != nullptr)
         setMouseCursor(*grabCursor);
@@ -916,10 +1113,47 @@ void WaveformView::mouseDown(const juce::MouseEvent& e)
     if (e.mods.isLeftButtonDown())
     {
         const int lockIdx = hitTestClipLock(e.x, e.y, bounds);
-        if (lockIdx >= 0)
+        // Bounds-check the index against the lock vector. The hit
+        // test returns a valid index under normal model state, but
+        // a concurrent cut insert/remove on the message thread can
+        // shrink the vector between the hit test and this write.
+        // The defensive check turns a potential OOB into a no-op
+        // (the user just doesn't toggle the lock on this click)
+        // rather than a debug-mode assertion or heap corruption.
+        if (lockIdx >= 0
+            && lockIdx < static_cast<int>(clipLocks.size()))
         {
             clipLocks[lockIdx] = !clipLocks[lockIdx];
             repaint();
+            return;
+        }
+    }
+
+    // Fade handles take precedence over markers too — a press in
+    // the top-left or top-right corner of a clip starts a fade
+    // drag. The hit zone is inset from the slice edges so it
+    // doesn't overlap the marker line itself; a click on the
+    // marker line still routes to a marker drag.
+    if (e.mods.isLeftButtonDown())
+    {
+        const auto fadeHit = hitTestFadeHandle(e.x, e.y, bounds);
+        if (fadeHit.clipIndex >= 0
+            && (fadeHit.side == DragTarget::FadeIn
+                || fadeHit.side == DragTarget::FadeOut))
+        {
+            activeDrag = fadeHit.side;
+            activeFadeClipIndex = fadeHit.clipIndex;
+            dragStartX = e.x;
+            dragStartY = e.y;
+            dragCommitted = true;       // fade drag is a real drag
+            // Per-side cursor while the drag is in progress: the
+            // chevron stays in the direction the user is dragging
+            // (e.g. ChevronLeft for a fade-out drag, so the user
+            // keeps dragging toward the chevron's tip).
+            if (fadeHit.side == DragTarget::FadeIn && fadeInCursor != nullptr)
+                setMouseCursor(*fadeInCursor);
+            else if (fadeHit.side == DragTarget::FadeOut && fadeOutCursor != nullptr)
+                setMouseCursor(*fadeOutCursor);
             return;
         }
     }
@@ -1023,6 +1257,10 @@ void WaveformView::mouseDrag(const juce::MouseEvent& e)
         case DragTarget::Cut:
             applyMarkerDrag(activeDrag, e.x, bounds);
             break;
+        case DragTarget::FadeIn:
+        case DragTarget::FadeOut:
+            applyFadeDrag(activeDrag, activeFadeClipIndex, e.x, bounds);
+            break;
         case DragTarget::Pan:
             applyPan(e.x, e.y, bounds);
             break;
@@ -1083,7 +1321,20 @@ void WaveformView::mouseUp(const juce::MouseEvent& e)
                     // its muted tail.
                     selectedClipStart = chopStart;
                     selectedClipEnd   = chopEnd;
-                    previewEngine->playFrom(chopStart, chopEnd);
+                    // Resolve the clip's fade and pass it through so
+                    // the engine applies the per-clip envelope. Out-
+                    // of-range click seconds (above endSeconds) are
+                    // already gated above, so findClipIndexAt
+                    // returning -1 here is the "no fade" path.
+                    const int clipIdx = findClipIndexAt(clickSeconds);
+                    const double fadeIn  = (clipIdx >= 0
+                        && clipIdx < static_cast<int>(clipFades.size()))
+                        ? clipFades[clipIdx].fadeInSeconds  : 0.0;
+                    const double fadeOut = (clipIdx >= 0
+                        && clipIdx < static_cast<int>(clipFades.size()))
+                        ? clipFades[clipIdx].fadeOutSeconds : 0.0;
+                    previewEngine->playFrom(chopStart, chopEnd,
+                                            fadeIn, fadeOut);
                     startTimer(kPlayheadRepaintMs);
                 }
             }
@@ -1102,8 +1353,11 @@ void WaveformView::mouseUp(const juce::MouseEvent& e)
         const bool wasMarkerDrag = (activeDrag == DragTarget::Start
                                  || activeDrag == DragTarget::End
                                  || activeDrag == DragTarget::Cut);
+        const bool wasFadeDrag   = (activeDrag == DragTarget::FadeIn
+                                 || activeDrag == DragTarget::FadeOut);
         activeDrag = DragTarget::None;
         activeCutIndex = -1;
+        activeFadeClipIndex = -1;
         dragIntent = DragIntent::Unknown;
         dragAllowDiagonal = false;
         dragCommitted = false;
@@ -1115,6 +1369,9 @@ void WaveformView::mouseUp(const juce::MouseEvent& e)
         // in this milestone).
         if (wasMarkerDrag && partner != nullptr)
             partner->setChopRegion(startSeconds, endSeconds);
+        // Fade drag already published through setClipFadeIn / setClipFadeOut
+        // — host has been notified via onClipFadesChanged.
+        (void) wasFadeDrag;
     }
 
     // Restore the cursor that matches whatever's under the pointer now
@@ -1250,6 +1507,7 @@ void WaveformView::drawWaveform(juce::Graphics& g, juce::Rectangle<int> bounds)
     drawSlice(endSeconds, visEnd, palette.muted());
 
     drawClipLocks(g, bounds, visStart, visEnd);
+    drawClipFades(g, bounds, visStart, visEnd);
 }
 
 void WaveformView::drawClipLocks(juce::Graphics& g,
@@ -1257,7 +1515,7 @@ void WaveformView::drawClipLocks(juce::Graphics& g,
                                   double visStart,
                                   double visEnd)
 {
-    // Per-clip lock icon: a small lock at the top-right of each
+    // Per-clip lock icon: a small lock at the bottom-right of each
     // clip's slice in the active region. Skipped when the slice is
     // narrower than the icon — too narrow to be a useful target.
     if (clipLocks.empty())
@@ -1265,7 +1523,7 @@ void WaveformView::drawClipLocks(juce::Graphics& g,
 
     constexpr int kIconSize = 12;        // px on each side
     constexpr int kIconMargin = 4;        // px in from the slice's edges
-    const int iconY = bounds.getY() + kIconMargin;
+    const int iconY = bounds.getBottom() - kIconMargin - kIconSize;
 
     auto drawOne = [&](int clipXRight, bool locked)
     {
@@ -1292,7 +1550,7 @@ void WaveformView::drawClipLocks(juce::Graphics& g,
     double prev = startSeconds;
     for (size_t i = 0; i < clipLocks.size(); ++i)
     {
-        const double next = (i + 1 < cuts.size())
+        const double next = (i < cuts.size())
             ? cuts[i]
             : endSeconds;
         const double sliceLeft  = juce::jmax(prev, visStart);
@@ -1303,6 +1561,95 @@ void WaveformView::drawClipLocks(juce::Graphics& g,
             const int sliceLeftX  = secondsToX(sliceLeft,  bounds);
             if (sliceRightX - sliceLeftX >= kIconSize + kIconMargin * 2)
                 drawOne(sliceRightX, clipLocks[i]);
+        }
+        prev = next;
+    }
+}
+
+void WaveformView::drawClipFades(juce::Graphics& g,
+                                 juce::Rectangle<int> bounds,
+                                 double visStart,
+                                 double visEnd) const
+{
+    // Per-clip fade overlay. Each fade is a single diagonal line
+    // anchored at the bottom of the panel and reaching up to the
+    // fade handle's corner at the top — the same "drag from
+    // corner" affordance that other DAWs use to indicate the
+    // gain ramp visually. The bottom anchor is the inner end of
+    // the fade (where the audio is at full level); the top
+    // anchor is the handle (where the audio is at the muted
+    // end). The diagonal length grows with the drag distance.
+    //
+    // visStart / visEnd clip the line endpoints to the visible
+    // window so a fade that extends past the zoomed-into edge
+    // is drawn to the panel border rather than past it.
+    if (clipFades.empty())
+        return;
+
+    const float topY    = static_cast<float>(bounds.getY());
+    const float bottomY = static_cast<float>(bounds.getBottom());
+
+    double prev = startSeconds;
+    for (size_t i = 0; i < clipFades.size(); ++i)
+    {
+        const double next = (i < cuts.size())
+            ? cuts[i]
+            : endSeconds;
+        const ClipFade& fade = clipFades[i];
+        if (fade.fadeInSeconds > 0.0)
+        {
+            // Fade-in: BOTTOM endpoint is pinned to the clip's
+            // bottom-left corner (the "clip edge" at the start
+            // of the clip). TOP endpoint is at the drag handle
+            // position — the top of the panel at x = clipLeft
+            // + fadeInSeconds. As the user drags right, the top
+            // moves right, the line grows. The diagonal
+            // represents the gain ramp: zero at the top
+            // (handle), full at the bottom (clip's natural
+            // level at the inner end of the fade).
+            const double clipLeftSec = prev;
+            const double fadeEndSec  = std::min(next,
+                clipLeftSec + fade.fadeInSeconds);
+            if (fadeEndSec > clipLeftSec)
+            {
+                const double drawBotX  = juce::jmax(clipLeftSec, visStart);
+                const double drawTopX  = juce::jmin(fadeEndSec,   visEnd);
+                if (drawTopX > drawBotX)
+                {
+                    const int xBot = secondsToX(drawBotX, bounds);
+                    const int xTop = secondsToX(drawTopX, bounds);
+                    g.setColour(palette.labelText().withAlpha(0.6f));
+                    g.drawLine(static_cast<float>(xBot), bottomY,
+                               static_cast<float>(xTop), topY,
+                               1.5f);
+                }
+            }
+        }
+        if (fade.fadeOutSeconds > 0.0)
+        {
+            // Fade-out: BOTTOM endpoint is pinned to the clip's
+            // bottom-right corner (the "clip edge" at the end
+            // of the clip). TOP endpoint is at the drag handle
+            // position — the top of the panel at x = clipRight
+            // - fadeOutSeconds. As the user drags left, the top
+            // moves left, the line grows.
+            const double clipRightSec = next;
+            const double fadeStartSec = std::max(prev,
+                clipRightSec - fade.fadeOutSeconds);
+            if (clipRightSec > fadeStartSec)
+            {
+                const double drawBotX  = juce::jmin(clipRightSec,  visEnd);
+                const double drawTopX  = juce::jmax(fadeStartSec,  visStart);
+                if (drawBotX > drawTopX)
+                {
+                    const int xBot = secondsToX(drawBotX, bounds);
+                    const int xTop = secondsToX(drawTopX, bounds);
+                    g.setColour(palette.labelText().withAlpha(0.6f));
+                    g.drawLine(static_cast<float>(xBot), bottomY,
+                               static_cast<float>(xTop), topY,
+                               1.5f);
+                }
+            }
         }
         prev = next;
     }
@@ -1592,7 +1939,7 @@ int WaveformView::hitTestClipLock(int x, int y,
     constexpr int kIconSize = 12;
     constexpr int kIconMargin = 4;
     constexpr int kHitMargin = 2; // extra slack around the icon
-    const int iconY = bounds.getY() + kIconMargin;
+    const int iconY = bounds.getBottom() - kIconMargin - kIconSize;
     const int iconBottom = iconY + kIconSize;
 
     double visStart, visEnd;
@@ -1601,7 +1948,7 @@ int WaveformView::hitTestClipLock(int x, int y,
     double prev = startSeconds;
     for (size_t i = 0; i < clipLocks.size(); ++i)
     {
-        const double next = (i + 1 < cuts.size())
+        const double next = (i < cuts.size())
             ? cuts[i]
             : endSeconds;
         const double sliceLeft  = juce::jmax(prev,   visStart);
@@ -1626,6 +1973,252 @@ int WaveformView::hitTestClipLock(int x, int y,
         prev = next;
     }
     return -1;
+}
+
+WaveformView::FadeHandleHit WaveformView::hitTestFadeHandle(
+    int x, int y, juce::Rectangle<int> bounds) const
+{
+    // Both handles at every chop boundary are independently
+    // grabbable. There is no precedence — the user can pick
+    // either side of the boundary to drag. The split is by
+    // cursor x relative to the boundary:
+    //
+    //   - Cursor to the LEFT of (or at) the boundary: grab
+    //     the FadeOut handle of the LEFT-hand clip. Drag
+    //     shrinks the fade (left arrow chevron).
+    //   - Cursor to the RIGHT of the boundary: grab the
+    //     FadeIn handle of the RIGHT-hand clip. Drag grows
+    //     the fade (right arrow chevron).
+    //
+    // When a clip already has a fade, the handle lives at
+    // the top of the fade line, NOT at the boundary itself —
+    // so the FadeOut handle is at (boundary - fadeOut) and
+    // the FadeIn handle is at (boundary + fadeIn). The two
+    // hit zones are then at distinct x positions and don't
+    // overlap, so each is grabbable without affecting the
+    // other. When neither side has a fade yet, both handles
+    // sit AT the boundary; the cursor's x relative to that
+    // boundary picks the side.
+    //
+    // Hit-zone size: kFadeHitSize px square, generous enough
+    // that the corner is easy to hit even at small zoom
+    // levels where the visual chevron is sub-pixel.
+    if (clipFades.empty())
+        return { -1, DragTarget::None };
+    if (thumbnail.getTotalLength() <= 0.0)
+        return { -1, DragTarget::None };
+
+    double visStart, visEnd;
+    visibleWindow(visStart, visEnd);
+
+    const int numClips = static_cast<int>(clipFades.size());
+
+    // Clip-edge lookup helpers. clip i spans
+    // [clipLeftSec(i), clipRightSec(i)] in current-buffer
+    // seconds (the chop list plus the active-region
+    // sentinel boundaries at startSeconds and endSeconds).
+    auto clipLeftSec  = [&](int i)
+    {
+        double prev = startSeconds;
+        for (int k = 0; k < i; ++k) prev = cuts[k];
+        return prev;
+    };
+    auto clipRightSec = [&](int i)
+    {
+        return (static_cast<size_t>(i) < cuts.size())
+            ? cuts[i] : endSeconds;
+    };
+
+    // Build a hit zone around a single x position. y is the
+    // top strip of the panel; the height matches the hit
+    // size so the zone is a square that doesn't spill onto
+    // the waveform fill below.
+    auto makeHitZone = [&](int xCenter) -> juce::Rectangle<int>
+    {
+        return juce::Rectangle<int>(
+            xCenter - kFadeHitSize / 2,
+            bounds.getY(),
+            kFadeHitSize,
+            kFadeHitSize);
+    };
+
+    // Helper: for a clip index, the x of its fade-OUT
+    // handle. With no fade, the handle is at the clip's
+    // right boundary (the corner). With a fade, the handle
+    // moves to the top of the fade line, which is
+    // (clipRight - fadeOut) — to the LEFT of the boundary.
+    auto fadeOutHandleX = [&](int i) -> int
+    {
+        const double cRight = clipRightSec(i);
+        const double cLeft  = clipLeftSec(i);
+        const double handleSec = (clipFades[i].fadeOutSeconds > 0.0)
+            ? std::max(cRight - clipFades[i].fadeOutSeconds, cLeft)
+            : cRight;
+        return bounds.getX() + secondsToX(handleSec, bounds);
+    };
+
+    // Helper: for a clip index, the x of its fade-IN
+    // handle. With no fade, the handle is at the clip's
+    // left boundary. With a fade, the handle moves to the
+    // top of the fade line, which is (clipLeft + fadeIn) —
+    // to the RIGHT of the boundary.
+    auto fadeInHandleX = [&](int i) -> int
+    {
+        const double cLeft  = clipLeftSec(i);
+        const double cRight = clipRightSec(i);
+        const double handleSec = (clipFades[i].fadeInSeconds > 0.0)
+            ? std::min(cLeft + clipFades[i].fadeInSeconds, cRight)
+            : cLeft;
+        return bounds.getX() + secondsToX(handleSec, bounds);
+    };
+
+    // For each internal chop boundary, the FadeOut of the
+    // LEFT clip and the FadeIn of the RIGHT clip share an x
+    // when neither has a fade. The cursor's position relative
+    // to that boundary picks the side. When one or both have
+    // a fade, the two handles are at distinct x positions and
+    // each hit zone is independently checkable — the user can
+    // pick either without the other being in the way.
+    auto tryBoundary = [&](int leftClip, int rightClip)
+        -> FadeHandleHit
+    {
+        if (leftClip < 0 || leftClip >= numClips)
+            return { -1, DragTarget::None };
+        if (rightClip < 0 || rightClip >= numClips)
+            return { -1, DragTarget::None };
+        const int outX = fadeOutHandleX(leftClip);
+        const int inX  = fadeInHandleX(rightClip);
+        const juce::Rectangle<int> outHit = makeHitZone(outX);
+        const juce::Rectangle<int> inHit  = makeHitZone(inX);
+        const bool outContains = outHit.contains(x, y);
+        const bool inContains  = inHit.contains(x, y);
+        if (!outContains && !inContains)
+            return { -1, DragTarget::None };
+        if (outContains && !inContains)
+            return { leftClip, DragTarget::FadeOut };
+        if (inContains && !outContains)
+            return { rightClip, DragTarget::FadeIn };
+        // Both hit zones contain (x, y). Resolve by which
+        // handle centre is closer — the user is on the side
+        // of the closer handle. Ties (handles at the same x,
+        // i.e. neither clip has a fade yet) default to FadeOut
+        // of the left clip so the chevron-left is the primary
+        // affordance; the right side of the boundary flips to
+        // FadeIn as soon as the cursor moves one pixel right.
+        if (x < outX)        return { leftClip,  DragTarget::FadeOut };
+        if (x > inX)         return { rightClip, DragTarget::FadeIn  };
+        // x is between the two centres (or exactly on one).
+        // If outX < inX (FadeOut handle is to the left of
+        // FadeIn handle), pick by the boundary midpoint.
+        const int mid = (outX + inX) / 2;
+        if (x <= mid)        return { leftClip,  DragTarget::FadeOut };
+        else                return { rightClip, DragTarget::FadeIn  };
+    };
+
+    // Walk every internal cut. leftClip = k, rightClip = k + 1.
+    for (size_t k = 0; k < cuts.size(); ++k)
+    {
+        const auto hit = tryBoundary(static_cast<int>(k),
+                                      static_cast<int>(k) + 1);
+        if (hit.clipIndex >= 0)
+            return hit;
+    }
+
+    // Outer edges of the active region: the first clip's
+    // FadeIn (left) and the last clip's FadeOut (right).
+    // These have no boundary partner on the outer side, so
+    // the handle is the corner of the clip itself. (When a
+    // fade exists the handle moves off the corner along the
+    // top of the fade line; fadeInHandleX/fadeOutHandleX
+    // already account for that.)
+    if (numClips > 0)
+    {
+        const int inX  = fadeInHandleX(0);
+        if (makeHitZone(inX).contains(x, y))
+            return { 0, DragTarget::FadeIn };
+        const int lastClip = numClips - 1;
+        const int outX = fadeOutHandleX(lastClip);
+        if (makeHitZone(outX).contains(x, y))
+            return { lastClip, DragTarget::FadeOut };
+    }
+
+    return { -1, DragTarget::None };
+}
+void WaveformView::applyFadeDrag(DragTarget target, int clipIndex, int x,
+                                 juce::Rectangle<int> bounds)
+{
+    if (target != DragTarget::FadeIn && target != DragTarget::FadeOut)
+        return;
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(clipFades.size()))
+        return;
+
+    // Resolve the clip's slice from the chop list. The drag x maps
+    // to a time within the visible window; we convert back to
+    // seconds and clamp to the slice's [leftEdge, rightEdge]
+    // range so the fade length is bounded by the clip itself.
+    double prev = startSeconds;
+    for (int i = 0; i < clipIndex; ++i)
+        prev = cuts[i];
+    const double next = (clipIndex < static_cast<int>(cuts.size()))
+        ? cuts[clipIndex]
+        : endSeconds;
+    const double clipLeft  = prev;
+    const double clipRight = next;
+
+    // Clamp the drag x to the slice's pixel range, then convert
+    // to a time. The fade length is measured from the side the
+    // handle sits on:
+    //   - FadeIn (handle at the top-left corner): length is the
+    //     distance from the clip's left edge to the drag x.
+    //     Dragging right grows the fade.
+    //   - FadeOut (handle at the top-right corner): length is
+    //     the distance from the drag x to the clip's right
+    //     edge. Dragging left grows the fade.
+    // The previous version used `clampedSeconds - clipLeft` for
+    // both sides, which inverted the fade-out drag (dragging
+    // left made the fade grow to the right). The per-side
+    // measure below fixes that.
+    const int sliceLeftX  = secondsToX(clipLeft,  bounds);
+    const int sliceRightX = secondsToX(clipRight, bounds);
+    const int clampedX = juce::jlimit(sliceLeftX, sliceRightX, x);
+    const double clampedSeconds = xToSeconds(clampedX, bounds);
+    const double fadeSeconds = (target == DragTarget::FadeIn)
+        ? std::max(0.0, clampedSeconds - clipLeft)
+        : std::max(0.0, clipRight - clampedSeconds);
+
+    if (target == DragTarget::FadeIn)
+        clipFades[clipIndex].fadeInSeconds = fadeSeconds;
+    else
+        clipFades[clipIndex].fadeOutSeconds = fadeSeconds;
+
+    if (onClipFadesChanged != nullptr)
+        onClipFadesChanged();
+}
+
+juce::Rectangle<int> WaveformView::clipSlicePixels(int clipIndex,
+                                                   juce::Rectangle<int> bounds,
+                                                   double visStart,
+                                                   double visEnd) const
+{
+    if (clipIndex < 0 || clipIndex >= static_cast<int>(clipFades.size()))
+        return {};
+    double prev = startSeconds;
+    for (int i = 0; i < clipIndex; ++i)
+        prev = cuts[i];
+    const double next = (clipIndex < static_cast<int>(cuts.size()))
+        ? cuts[clipIndex]
+        : endSeconds;
+    const double sliceLeft  = juce::jmax(prev, visStart);
+    const double sliceRight = juce::jmin(next, visEnd);
+    if (sliceRight <= sliceLeft)
+        return {};
+    const int sliceLeftX  = secondsToX(sliceLeft,  bounds);
+    const int sliceRightX = secondsToX(sliceRight, bounds);
+    return juce::Rectangle<int>(
+        bounds.getX() + sliceLeftX,
+        bounds.getY(),
+        sliceRightX - sliceLeftX,
+        bounds.getHeight());
 }
 
 void WaveformView::applyMarkerDrag(DragTarget target, int x,

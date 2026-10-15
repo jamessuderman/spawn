@@ -51,7 +51,17 @@ public:
     // to startSeconds). startSeconds must be < endSeconds and both
     // must lie within the loaded buffer; out-of-range values are
     // clamped silently to the buffer's extent.
-    void playFrom(double startSeconds, double endSeconds);
+    //
+    // Optional fadeIn / fadeOut lengths (in seconds) apply a linear
+    // gain envelope: gain ramps from 0→1 over the first
+    // `fadeInSeconds` of the window and from 1→0 over the last
+    // `fadeOutSeconds`. Fades that would overlap (sum > window
+    // length) are silently clamped so the envelope stays well-
+    // defined — the host can re-call with shorter values if it
+    // wants a stricter limit. Both default to 0.0 (no envelope).
+    void playFrom(double startSeconds, double endSeconds,
+                  double fadeInSeconds = 0.0,
+                  double fadeOutSeconds = 0.0);
 
     // Live-update the play window without restarting playback. Used
     // while the engine is playing (typically looping) so dragging the
@@ -60,7 +70,13 @@ public:
     // startSample/endSample change. Out-of-range / degenerate values
     // (startSeconds >= endSeconds, or either beyond the buffer) are
     // clamped to the loaded buffer's extent, matching playFrom().
-    void setPlayWindow(double startSeconds, double endSeconds);
+    //
+    // fadeInSeconds / fadeOutSeconds follow the same semantics as
+    // playFrom(); a re-trigger (the audio thread has just looped
+    // or restarted) re-anchors the envelope at the new window.
+    void setPlayWindow(double startSeconds, double endSeconds,
+                       double fadeInSeconds = 0.0,
+                       double fadeOutSeconds = 0.0);
 
     // Stop playback. After this returns isPlaying() is false and the
     // next getNextAudioBlock outputs silence. posSample is parked at 0
@@ -182,17 +198,21 @@ private:
     // pause/setBuffer/setLoopEnabled; the audio thread reads via
     // getNextAudioBlock. The atomic State carries "playing" vs "idle",
     // the current play window (startSample, endSample) expressed in
-    // source-buffer samples, the running playhead (posSample), AND the
-    // loop flag. Folding the position into the same atomic as the window
-    // is what makes the re-trigger race-free: playFrom() publishes all
-    // four in a single store so the audio thread can never observe the
-    // new window paired with a stale playhead from the previous play.
+    // source-buffer samples, the running playhead (posSample), the
+    // loop flag, AND the per-window fade envelope (fadeInSamples,
+    // fadeOutSamples). Folding the position into the same atomic as
+    // the window is what makes the re-trigger race-free: playFrom()
+    // publishes all six in a single store so the audio thread can
+    // never observe the new window paired with a stale playhead or
+    // envelope from the previous play.
     struct TransportState {
         bool    playing     = false;
         bool    loopEnabled = false;
         int64_t startSample = 0;
         int64_t endSample   = 0;
         int64_t posSample   = 0;  // running playhead, source samples
+        int64_t fadeInSamples  = 0;  // 0..endSample-startSample, length of fade-in ramp
+        int64_t fadeOutSamples = 0;  // 0..endSample-startSample, length of fade-out ramp
     };
     std::atomic<TransportState> transport{{}};
 

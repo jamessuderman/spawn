@@ -136,7 +136,6 @@ public:
         auto settingsFile = makeTempDir("settings").getChildFile("settings.properties");
         SettingsStore store(settingsFile);
 
-        beginTest("removeCut rejects out-of-range indices");
         {
             Palette palette(store);
             WaveformView view(palette);
@@ -161,7 +160,6 @@ public:
             expectEquals(cuts[2], 0.75);
         }
 
-        beginTest("removeCut erases at the right index and keeps order");
         {
             Palette palette(store);
             WaveformView view(palette);
@@ -188,7 +186,6 @@ public:
             expectEquals(cuts[1], 0.4);
         }
 
-        beginTest("re-adding a removed cut works");
         {
             // addCut needs a non-zero sample length, so we load a
             // real file. The silent 1 s WAV gives us predictable
@@ -220,7 +217,6 @@ public:
             dir.deleteRecursively();
         }
 
-        beginTest("findChopAt merges neighbours when a middle cut is removed");
         {
             // Load a real sample so findChopAt has a non-zero
             // length to compute against. Silent 1 s WAV at 44.1 kHz.
@@ -319,7 +315,6 @@ public:
         auto settingsFile = makeTempDir("settings_sel").getChildFile("settings.properties");
         SettingsStore store(settingsFile);
 
-        beginTest("removing the start-edge cut expands selection left");
         {
             auto dir = makeTempDir("sel_start");
             const auto file = writeSilentWav(dir);
@@ -338,7 +333,6 @@ public:
             expectSelected(view, 0.0, 0.5);
         }
 
-        beginTest("removing the end-edge cut expands selection right");
         {
             auto dir = makeTempDir("sel_end");
             const auto file = writeSilentWav(dir);
@@ -357,7 +351,6 @@ public:
             expectSelected(view, 0.25, 0.75);
         }
 
-        beginTest("removing a cut that is neither edge leaves selection alone");
         {
             auto dir = makeTempDir("sel_neither");
             const auto file = writeSilentWav(dir);
@@ -382,7 +375,6 @@ public:
             expectEquals(cuts[1], 0.75);
         }
 
-        beginTest("removing a cut with no selection is a no-op for the selection");
         {
             auto dir = makeTempDir("sel_empty");
             const auto file = writeSilentWav(dir);
@@ -405,7 +397,6 @@ public:
             expectSelected(view, 0.0, 0.0);
         }
 
-        beginTest("removing the only cut collapses the selection to the merged chop");
         {
             // startSeconds == 0, endSeconds == length (the
             // post-loadFile defaults). Removing the only cut should
@@ -454,7 +445,6 @@ public:
             expectEquals(view.getEndSeconds(),   1.0);
         }
 
-        beginTest("trimmed-WAV reload keeps a usable chop region");
         {
             // Reproduces the user-reported trim bug end-to-end via the
             // file-based path that was used before reloadFromBuffer():
@@ -598,7 +588,6 @@ public:
             expectEquals(selEnd,   0.9);
         }
 
-        beginTest("clearCuts: no-op when cuts are already empty");
         {
             // Calling clearCuts on a freshly-loaded sample must be
             // harmless — no crash, no spurious repaint side effects,
@@ -844,7 +833,6 @@ public:
             expect(!after[3]);
         }
 
-        beginTest("clip locks: clearCuts resets the lock vector");
         {
             // After clearCuts the buffer is one big chop. Lock
             // vector should have exactly one entry (default false).
@@ -915,7 +903,6 @@ public:
 
     void runTest() override
     {
-        beginTest("chop-drag during playback does not crash");
 
         PreviewEngine engine;
         engine.setBuffer(
@@ -1007,7 +994,155 @@ public:
     }
 };
 
+// Per-clip fade model. Tests the public API: getClipFades,
+// setClipFades, setClipFadeIn, setClipFadeOut, the sync of
+// clipFades to the chop list, and the merge rule on cut removal.
+class WaveformViewClipFadeTests : public juce::UnitTest {
+public:
+    WaveformViewClipFadeTests() : juce::UnitTest("WaveformView clip fades") {}
+
+    void runTest() override
+    {
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            // No file loaded — pure model exercise. setCuts directly
+            // populates the chop list without needing audio.
+            view.setCuts({ 0.25, 0.75 });
+            // After setCuts the lock/fade vectors should each have
+            // 3 entries (one per clip).
+            expectEquals(static_cast<int>(view.getClipFades().size()), 3);
+            // Default values are (0, 0).
+            for (const auto& f : view.getClipFades())
+            {
+                expectEquals(f.fadeInSeconds, 0.0);
+                expectEquals(f.fadeOutSeconds, 0.0);
+            }
+        }
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            view.setCuts({ 0.5 });
+            view.setClipFadeIn(0, 0.1);
+            view.setClipFadeOut(1, 0.2);
+            const auto fades = view.getClipFades();
+            expectEquals(static_cast<int>(fades.size()), 2);
+            expectEquals(fades[0].fadeInSeconds,  0.1);
+            expectEquals(fades[0].fadeOutSeconds, 0.0);
+            expectEquals(fades[1].fadeInSeconds,  0.0);
+            expectEquals(fades[1].fadeOutSeconds, 0.2);
+            expect(view.isClipFaded(0));
+            expect(view.isClipFaded(1));
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            view.setCuts({ 0.5 });
+            view.setClipFadeIn(0, -0.5);
+            expectEquals(view.getClipFades()[0].fadeInSeconds, 0.0);
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            // No cuts, so the single clip is [startSeconds, endSeconds]
+            // which both default to 0. Use a loaded file to get a
+            // non-zero length.
+            auto dir = makeTempDir("fade_clamp");
+            const auto file = writeSilentWav(dir);
+            expect(view.loadFile(file));
+            // Sample is 1 second. Set fade-in to 10 seconds — should
+            // clamp to the clip's full length.
+            view.setClipFadeIn(0, 10.0);
+            const double length = view.getEndSeconds() - view.getStartSeconds();
+            expectEquals(view.getClipFades()[0].fadeInSeconds, length);
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            view.setCuts({ 0.5 });
+            int fireCount = 0;
+            view.onClipFadesChanged = [&]() { ++fireCount; };
+            view.setClipFadeIn(0, 0.1);
+            view.setClipFadeOut(0, 0.2);
+            expectEquals(fireCount, 2);
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            view.setCuts({ 0.5 });
+            view.setClipFadeOut(0, 0.1);  // left clip's fade-out
+            view.setClipFadeIn(1, 0.2);   // right clip's fade-in
+            // Remove the cut between them — the two clips merge.
+            // The merged pair should be: (left.fadeIn=0, right.fadeOut=0)
+            // — i.e., the merge rule is "left's fade-in survives,
+            // right's fade-out survives". The right's fade-in
+            // (which was the leading edge of the now-absorbed
+            // right clip) drops, and the left's fade-out drops
+            // too because the merged clip's right edge is now the
+            // old right's right edge.
+            expect(view.removeCut(0));
+            const auto fades = view.getClipFades();
+            expectEquals(static_cast<int>(fades.size()), 1);
+            expectEquals(fades[0].fadeInSeconds,  0.0);
+            expectEquals(fades[0].fadeOutSeconds, 0.0);
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            auto dir = makeTempDir("apply_fade");
+            const auto file = writeSilentWav(dir);
+            expect(view.loadFile(file));
+            // 1-second sample, single clip [0, 1]. No cuts.
+            const juce::Rectangle<int> bounds(0, 0, 1000, 200);
+            // Drag the fade-in handle to roughly 25 % of the clip.
+            // Clip starts at 0, ends at 1 second. The clip maps to
+            // x ∈ [0, 1000]. 25 % of the way is x = 250.
+            view.applyFadeDrag(WaveformView::DragTarget::FadeIn,
+                               0, 250, bounds);
+            const auto f0 = view.getClipFades()[0];
+            expect(f0.fadeInSeconds > 0.0);
+            expectEquals(f0.fadeOutSeconds, 0.0);
+            // Drag the fade-out handle to roughly 75 %.
+            view.applyFadeDrag(WaveformView::DragTarget::FadeOut,
+                               0, 750, bounds);
+            const auto f1 = view.getClipFades()[0];
+            expect(f1.fadeInSeconds > 0.0);
+            expect(f1.fadeOutSeconds > 0.0);
+            // fadeOut = end - xToSeconds(750) — must be > 0 and
+            // < clip length.
+            expect(f1.fadeOutSeconds < 1.0);
+        }
+
+        {
+            SettingsStore store;
+            Palette palette(store);
+            WaveformView view(palette);
+            view.setCuts({ 0.5 });
+            view.setClipFadeIn(0, 0.1);
+            const auto before = view.getClipFades();
+            view.setClipLocks({ true, false });
+            const auto after = view.getClipFades();
+            expectEquals(after.size(), before.size());
+            expectEquals(after[0].fadeInSeconds, 0.1);
+        }
+    }
+};
+
 static WaveformViewCutTests waveformViewCutTests;
 static WaveformViewSelectionUpdateTests waveformViewSelectionUpdateTests;
 static WaveformViewChopDragDuringPlaybackRegression
     waveformViewChopDragDuringPlaybackRegression;
+static WaveformViewClipFadeTests waveformViewClipFadeTests;
+

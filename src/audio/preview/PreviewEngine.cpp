@@ -18,6 +18,52 @@ int64_t secondsToSourceSample(double seconds, double sourceRate,
     return juce::jlimit<int64_t>(0, totalSamples, s);
 }
 
+// Linear fade envelope gain at a given source-sample position
+// within a play window. Returns:
+//   - 0 at the very start of the window when fadeInSamples > 0
+//   - ramps linearly to 1 over [startSample, startSample + fadeInSamples)
+//   - 1 across the middle of the window
+//   - ramps linearly to 0 over (endSample - fadeOutSamples, endSample]
+//   - 0 past endSample
+// The function is a pure mapping (no I/O, no atomics) and runs in
+// the audio thread's per-sample hot path. The fade lengths come
+// from the TransportState the caller just snapshot-loaded; they
+// are bounded by (endSample - startSample) so the linear ramp is
+// always well-defined.
+float envelopeGain(int64_t srcSample, int64_t startSample, int64_t endSample,
+                   int64_t fadeInSamples, int64_t fadeOutSamples) noexcept
+{
+    if (srcSample <= startSample)
+    {
+        // Before/at the start: ramp from 0 to 1 over fadeInSamples.
+        // fadeInSamples == 0 collapses to 1 (no ramp).
+        if (fadeInSamples <= 0)
+            return 1.0f;
+        return 0.0f;
+    }
+    if (srcSample >= endSample)
+        return 0.0f;
+
+    // In-range: compute the ramps.
+    float inGain  = 1.0f;
+    float outGain = 1.0f;
+    if (fadeInSamples > 0)
+    {
+        const int64_t intoFade = srcSample - startSample;
+        if (intoFade < fadeInSamples)
+            inGain = static_cast<float>(intoFade)
+                   / static_cast<float>(fadeInSamples);
+    }
+    if (fadeOutSamples > 0)
+    {
+        const int64_t fromEnd = endSample - srcSample;
+        if (fromEnd < fadeOutSamples)
+            outGain = static_cast<float>(fromEnd)
+                    / static_cast<float>(fadeOutSamples);
+    }
+    return inGain * outGain;
+}
+
 } // namespace
 
 PreviewEngine::PreviewEngine() = default;
@@ -70,7 +116,8 @@ void PreviewEngine::setBuffer(
     transport.store(idle, std::memory_order_release);
 }
 
-void PreviewEngine::playFrom(double startSeconds, double endSeconds)
+void PreviewEngine::playFrom(double startSeconds, double endSeconds,
+                             double fadeInSeconds, double fadeOutSeconds)
 {
     const int64_t total = totalSourceSamples.load(std::memory_order_acquire);
     const double rate = sourceSampleRate.load(std::memory_order_acquire);
@@ -94,15 +141,40 @@ void PreviewEngine::playFrom(double startSeconds, double endSeconds)
             s = juce::jmax<int64_t>(0, e - 1);
     }
 
+    // Convert the fade lengths (seconds) to source samples and clamp
+    // so they can never overlap or exceed the window. The audio
+    // thread reads these from the same atomic as the play window so
+    // the envelope is anchored to the window itself, not to the
+    // playhead — a re-trigger restarts both at once.
+    int64_t fadeIn  = juce::jmax<int64_t>(0,
+        static_cast<int64_t>(std::llround(std::max(0.0, fadeInSeconds) * rate)));
+    int64_t fadeOut = juce::jmax<int64_t>(0,
+        static_cast<int64_t>(std::llround(std::max(0.0, fadeOutSeconds) * rate)));
+    const int64_t windowLen = e - s;
+    if (fadeIn + fadeOut > windowLen)
+    {
+        // Proportionally scale both so they fit. Preferring the
+        // user-supplied ratio (in case the user set them
+        // intentionally) keeps a 1:1 fade pair reading as 1:1
+        // even when the window is shorter than their sum.
+        const double k = static_cast<double>(windowLen)
+                        / static_cast<double>(fadeIn + fadeOut);
+        fadeIn  = static_cast<int64_t>(static_cast<double>(fadeIn)  * k);
+        fadeOut = static_cast<int64_t>(static_cast<double>(fadeOut) * k);
+    }
+
     TransportState next = transport.load(std::memory_order_relaxed);
-    next.playing     = true;
-    next.startSample = s;
-    next.endSample   = e;
-    next.posSample   = s;
+    next.playing        = true;
+    next.startSample    = s;
+    next.endSample      = e;
+    next.posSample      = s;
+    next.fadeInSamples  = fadeIn;
+    next.fadeOutSamples = fadeOut;
     transport.store(next, std::memory_order_release);
 }
 
-void PreviewEngine::setPlayWindow(double startSeconds, double endSeconds)
+void PreviewEngine::setPlayWindow(double startSeconds, double endSeconds,
+                                  double fadeInSeconds, double fadeOutSeconds)
 {
     // Live-update the play window without restarting. Used while the
     // engine is playing (typically looping) so a mid-loop drag of the
@@ -128,9 +200,24 @@ void PreviewEngine::setPlayWindow(double startSeconds, double endSeconds)
             s = juce::jmax<int64_t>(0, e - 1);
     }
 
+    int64_t fadeIn  = juce::jmax<int64_t>(0,
+        static_cast<int64_t>(std::llround(std::max(0.0, fadeInSeconds) * rate)));
+    int64_t fadeOut = juce::jmax<int64_t>(0,
+        static_cast<int64_t>(std::llround(std::max(0.0, fadeOutSeconds) * rate)));
+    const int64_t windowLen = e - s;
+    if (fadeIn + fadeOut > windowLen)
+    {
+        const double k = static_cast<double>(windowLen)
+                        / static_cast<double>(fadeIn + fadeOut);
+        fadeIn  = static_cast<int64_t>(static_cast<double>(fadeIn)  * k);
+        fadeOut = static_cast<int64_t>(static_cast<double>(fadeOut) * k);
+    }
+
     TransportState next = transport.load(std::memory_order_relaxed);
-    next.startSample = s;
-    next.endSample   = e;
+    next.startSample    = s;
+    next.endSample      = e;
+    next.fadeInSamples  = fadeIn;
+    next.fadeOutSamples = fadeOut;
     // posSample and playing intentionally untouched.
     transport.store(next, std::memory_order_release);
 }
@@ -528,6 +615,14 @@ void PreviewEngine::getNextAudioBlock(
 
     const float g = gain.load(std::memory_order_relaxed);
 
+    // Snapshot the fade envelope lengths once for this block. The
+    // play window + fades are re-read inside the loop (so a UI
+    // publish mid-block takes effect on the next sample after the
+    // publish), but the actual sample-by-sample gain is computed
+    // off the live per-iteration state — see envelopeGain() below.
+    // A local auto-lambda captures the current TransportState's
+    // fade lengths via the per-iteration liveT reload.
+
     // Render in source-sample space and write into the output at the
     // device's sample rate. This is integer-N:1 / 1:N resampling with
     // a single repeating nearest-neighbour tap, which is good enough
@@ -567,12 +662,14 @@ void PreviewEngine::getNextAudioBlock(
                 // sample i also comes from the loop top.
                 const int64_t rewindIdx = posSource
                     + static_cast<int64_t>(std::llround(static_cast<double>(i) / ratio));
+                const float env = envelopeGain(rewindIdx, liveStart, liveEnd,
+                    liveT.fadeInSamples, liveT.fadeOutSamples);
                 for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
                 {
                     const int srcCh = juce::jmin(ch, numChannels - 1);
                     const float* src = bufferSnapshot->getReadPointer(srcCh);
                     float* dst = info.buffer->getWritePointer(ch, writeStart);
-                    dst[i] = src[rewindIdx] * g;
+                    dst[i] = src[rewindIdx] * g * env;
                 }
                 continue;
             }
@@ -598,12 +695,14 @@ void PreviewEngine::getNextAudioBlock(
         // output, scaled by gain. We mix down multi-channel source
         // to whatever channel count the device asked for; for a
         // 2-channel device (the M1 default) this is a straight copy.
+        const float env = envelopeGain(srcIdx, liveStart, liveEnd,
+            liveT.fadeInSamples, liveT.fadeOutSamples);
         for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch)
         {
             const int srcCh = juce::jmin(ch, numChannels - 1);
             const float* src = bufferSnapshot->getReadPointer(srcCh);
             float* dst = info.buffer->getWritePointer(ch, writeStart);
-            dst[i] = src[srcIdx] * g;
+            dst[i] = src[srcIdx] * g * env;
         }
     }
 

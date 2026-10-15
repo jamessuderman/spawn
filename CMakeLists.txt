@@ -57,6 +57,8 @@ if(SPAWN_BUILD_STANDALONE)
             resources/icons/lucide/dice-5.svg
             resources/icons/lucide/x-line.svg
             resources/icons/lucide/lock.svg
+            resources/icons/lucide/chevron-left.svg
+            resources/icons/lucide/chevron-right.svg
             resources/assets/Knob.svg
             resources/assets/Button.svg
             resources/licences/LICENCE-PublicSans.md
@@ -161,6 +163,7 @@ if(SPAWN_BUILD_TESTS)
             juce::juce_audio_basics
             juce::juce_audio_formats
             juce::juce_audio_utils
+            juce::juce_graphics
             juce::juce_gui_basics
             SpawnAssets
             juce::juce_recommended_config_flags
