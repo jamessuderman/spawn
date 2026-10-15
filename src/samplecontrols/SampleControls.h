@@ -1,15 +1,25 @@
 // Spawn — SampleControls.
-// A square container that hosts the "sample-level" controls for the
-// project (today: a single volume Knob). It deliberately has no
-// background of its own — its only job is to lay out the controls so
-// the host doesn't have to manage those bounds. Sized to fit the Knob
-// at its default size; new sample-level widgets go here as the
-// project grows.
+//
+// Lives below the Display panel. Hosts the per-sample / per-track
+// controls: placeholder knobs on the left, each wired to nothing
+// yet. When real DSP lands (filter / drive / envelope attack /
+// etc.) these slots are reused; the layout already accommodates the
+// chosen knob count.
+//
+// Per-sample, NOT per-clip — Clock has one BPM for the loaded
+// audio and that's tracked in MasterControls (header row, right
+// column). SampleControls is the per-track-effect row; BPM and Bars
+// are global, hence their placement above.
+//
+// The placeholder knobs respond to mouse drag (so the UI feels
+// alive when the user mouses over them) but their onChange handlers
+// stay unbound; the SLOT is here, the BEHAVIOUR is deferred.
 
 #pragma once
 
 #include <JuceHeader.h>
 
+#include <array>
 #include <memory>
 
 #include "../ui/lookandfeel/Palette.h"
@@ -18,11 +28,16 @@ namespace spawn::ui {
 
 class Knob;
 
+// Number of placeholder knobs in this panel. Hard-coded to 4 per
+// the M1.5 planning session ("3 or 4 knobs that do nothing").
+// Adjust when real DSP lands.
+constexpr int kSampleControlsPlaceholderCount = 4;
+
 class SampleControls : public juce::Component {
 public:
-    // Square edge length in pixels. Sized to match the Knob's footprint
-    // so the container wraps the knob with no extra padding.
-    static constexpr int kSize = 50;
+    // Total height of this row. Hosts reserve this much vertical
+    // space below the Display.
+    static constexpr int kHeight = 60;
 
     explicit SampleControls(Palette& palette);
     ~SampleControls() override;
@@ -30,15 +45,15 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
 
-    // Wire the knob's onChange. The host uses this to drive the
-    // preview-engine gain.
-    using OnVolumeChange = std::function<void(double)>;
-    void setOnVolumeChange(OnVolumeChange handler);
-
 private:
     Palette& palette;
-    std::unique_ptr<Knob> knob;
-    OnVolumeChange onVolumeChange;
+
+    // Placeholder knobs. Each renders the SVG, takes mouse drag,
+    // snaps to default on double-click, and writes its value back
+    // to itself (so the visual indicator moves) — but no onChange
+    // is wired. When real DSP plugs in, each knob gains an
+    // onChange that drives the corresponding effect parameter.
+    std::array<std::unique_ptr<Knob>, kSampleControlsPlaceholderCount> knobs;
 };
 
 } // namespace spawn::ui

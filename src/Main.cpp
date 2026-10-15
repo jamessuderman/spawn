@@ -13,8 +13,12 @@
 #include "audio/preview/AudioDeviceHolder.h"
 #include "audio/preview/PreviewEngine.h"
 #include "audio/preview/SampleDecoder.h"
+#include "audio/preview/TempoInspector.h"
 #include "controlheader/ControlHeader.h"
 #include "display/Display.h"
+#include "dsp/Clock.h"
+#include "dsp/WavTempoReader.h"
+#include "samplecontrols/MasterControls.h"
 #include "samplecontrols/SampleControls.h"
 #include "sequencer/SequencerView.h"
 #include "settings/SettingsView.h"
@@ -210,8 +214,11 @@ namespace
                     controlHeader = std::make_unique<spawn::ui::ControlHeader>(palette);
                     toolbar = std::make_unique<spawn::ui::Toolbar>(palette);
                     display = std::make_unique<spawn::ui::Display>(palette);
+                    masterControls = std::make_unique<spawn::ui::MasterControls>(palette);
                     sampleControls = std::make_unique<spawn::ui::SampleControls>(palette);
                     transport = std::make_unique<spawn::ui::Transport>(palette);
+                    clock = std::make_unique<spawn::dsp::Clock>();
+                    tempoInspector = std::make_unique<spawn::audio::TempoInspector>();
 
                     // The WaveformView (and its AudioThumbnail) live for the whole
                     // window lifetime, so a loaded file sticks across content swaps.
@@ -243,19 +250,31 @@ namespace
                     addAndMakeVisible(controlHeader.get());
                     addAndMakeVisible(toolbar.get());
                     addAndMakeVisible(display.get());
+                    addAndMakeVisible(masterControls.get());
                     addAndMakeVisible(sampleControls.get());
                     addAndMakeVisible(transport.get());
 
-                    // Wire the volume knob: every value change publishes
-                    // to the engine's gain. The engine stores an atomic
-                    // float; the UI thread's setGain is lock-free and
-                    // safe to call from the message thread.
-                    sampleControls->setOnVolumeChange(
+                    // Wire the MasterControls (volume knob + BPM/Bars
+                    // editors) to the engine and the project Clock.
+                    // The volume knob drives preview-engine gain. The
+                    // BPM/Bars editors read/write through the Clock.
+                    masterControls->setOnVolumeChange(
                         [this](double v) { engine.setGain(static_cast<float>(v)); });
-                    // Push the knob's current value (default 0.5) to the
-                    // engine so the very first click plays at the visible
-                    // knob position even before the user touches it.
+                    // Push the knob's current value (default 0.5) to
+                    // the engine so the very first click plays at the
+                    // visible knob position even before the user
+                    // touches it. Volume is 0.5 → ~ -6 dB, the default
+                    // we'd want when no audio is loaded yet.
                     engine.setGain(0.5f);
+
+                    // Hand the Clock to MasterControls so the BPM/Bars
+                    // editors show the right numbers and edit the right
+                    // state. We're handing the same Clock to TempoInspector
+                    // later so it can write detection results in place.
+                    masterControls->setClock(clock.get());
+                    // Show the initial defaults (120 BPM / 4 bars) in
+                    // the editors right away.
+                    masterControls->syncFromClock();
 
                     // Transport buttons drive the PreviewEngine from the
                     // header row. Play resumes from the engine's current
@@ -392,67 +411,81 @@ namespace
                     //   ┌──────────────────────────────────────────────┐
                     //   │ kOuterPaddingY = 16 px                     │
                     //   │ kHeaderRow tall, full width                │
-                    //   │   ┌──────────────────────┐ ┌──────┐ ┌───┐   │
-                    //   │   │ ControlHeader (left) │ │Trans-│ │Vol│   │
-                    //   │   │ Toolbar      (left) │ │ port │ │knb│   │
-                    //   │   │ (column, gap inside) │ │strip │ └───┘   │
-                    //   │   └──────────────────────┘ └──────┘         │
+                    //   │   ┌──────────────────────┐ ┌──────┐ ┌─────────┐
+                    //   │   │ ControlHeader (left) │ │Trans-│ │Master-  │
+                    //   │   │ Toolbar      (left) │ │ port │ │Controls │
+                    //   │   │ (column, gap inside) │ │strip │ │         │
+                    //   │   └──────────────────────┘ └──────┘ └─────────┘
                     //   │ kGap                                         │
                     //   │ Display (full width, Display::kHeight)      │
+                    //   │ kGap                                         │
+                    //   │ SampleControls (placeholder knobs row)      │
+                    //   │   SampleControls::kHeight tall              │
                     //   └──────────────────────────────────────────────┘
-                    // The header row is a single horizontal band that
-                    // contains a left column (display buttons on top of
-                    // tool buttons), a transport strip pushed to the
-                    // right next to the volume knob, and the volume
-                    // knob on the far right. All three sit inside the
-                    // same row so nothing can clip into the row below.
+                    //
+                    // Header row: left column (ControlHeader + Toolbar),
+                    // transport strip, and MasterControls (volume
+                    // knob + BPM/Bars editors) right-aligned. All three
+                    // sit in the same horizontal band so nothing can
+                    // clip into the row below.
+                    //
+                    // The MasterControls height is what drives the row
+                    // height. The vertical-center positioning puts the
+                    // toolbar and ControlHeader stacked-pair flush against
+                    // the MasterControls row's top and bottom edges.
                     const int headerRowHeight = juce::jmax(
                         spawn::ui::ControlHeader::kHeight + kGap
                             + spawn::ui::Toolbar::kHeight,
-                        spawn::ui::SampleControls::kSize);
+                        spawn::ui::MasterControls::kHeight);
 
                     auto topRow = getLocalBounds().withZeroOrigin()
                                                 .reduced(kOuterPaddingX, 0);
                     topRow.setY(kOuterPaddingY);
                     topRow.setHeight(headerRowHeight);
 
-                    // Right side of the row: sample knob first (far
-                    // right), then the transport strip immediately to
-                    // its left. removeFromRight pulls them off the row
-                    // in right-to-left order so the layout is
-                    // knob | transport | (left column).
-                    auto sampleBounds = topRow.removeFromRight(
-                        spawn::ui::SampleControls::kSize);
-                    sampleBounds.setY(topRow.getY()
-                        + (headerRowHeight - sampleBounds.getHeight()) / 2);
-                    sampleBounds.setSize(spawn::ui::SampleControls::kSize,
-                                         spawn::ui::SampleControls::kSize);
-                    sampleControls->setBounds(sampleBounds);
+                    // Right side of the row: MasterControls (volume knob
+                    // + BPM/Bars editors) on the far right, then the
+                    // transport strip immediately to its left, butting
+                    // up against the knob with an 8 px gap. Layout is
+                    //   master | (8 px) | transport | (left column)
+                    auto masterBounds = topRow.removeFromRight(
+                        spawn::ui::MasterControls::kWidth);
+                    masterBounds.setY(topRow.getY());
+                    masterBounds.setHeight(spawn::ui::MasterControls::kHeight);
+                    masterControls->setBounds(masterBounds);
 
-                    // Transport sits between the left column and the
-                    // volume knob. Vertically aligned with the display
-                    // buttons (ControlHeader) at the top of the row —
-                    // not centred in the row band — so the four chips
-                    // read as a sibling strip of the header.
-                    auto transportBounds = topRow.removeFromRight(
-                        kGap + transport->getPreferredWidth());
+                    // Transport sits to the immediate left of the volume knob. Right edge
+                    // of the transport sits 8 px to the left of the knob's
+                    // left edge so the two read as a paired band on the
+                    // right side of the header. Vertically aligned with
+                    // the knob (top row of the master column), not
+                    // centred in the row band, so the chips line up with
+                    // the knob disc. The knob itself lives at the right
+                    // edge of MasterControls, so its left edge is
+                    // masterBounds.right - kKnobSize.
+                    //
+                    // After positioning the transport, shrink topRow's
+                    // right edge to exclude it (plus the gap to the
+                    // left) so the left column assigned below stops at
+                    // the transport's left edge and never overlaps.
+                    constexpr int kTransportKnobGap = 8;
+                    constexpr int kLeftOfTransport = 8;
                     const int transportStripHeight = spawn::ui::Transport::kHeight;
-                    transportBounds.setY(topRow.getY());
-                    transportBounds.setHeight(transportStripHeight);
-                    // removeFromRight above pulled kGap extra to the
-                    // left of the transport, leaving the inner width
-                    // correct; just snap the height and keep width.
+                    const int transportWidth = transport->getPreferredWidth();
+                    const int knobLeft = masterBounds.getRight()
+                        - spawn::ui::MasterControls::kKnobSize;
+                    const int transportX = knobLeft
+                        - kTransportKnobGap
+                        - transportWidth;
                     transport->setBounds(
-                        transportBounds.getX(),
-                        transportBounds.getY(),
-                        transport->getPreferredWidth(),
+                        transportX,
+                        masterBounds.getY(),
+                        transportWidth,
                         transportStripHeight);
+                    topRow.setRight(transportX - kLeftOfTransport);
 
                     // Left column: ControlHeader top-aligned, Toolbar
-                    // bottom-aligned so the two strips read as a stacked
-                    // pair hugging the top and bottom of the row (the
-                    // Toolbar then sits flush with the row's bottom edge,
-                    // directly above the Display below).
+                    // bottom-aligned.
                     auto leftColumn = topRow;
                     leftColumn.setWidth(juce::jmax(0, topRow.getWidth()));
 
@@ -469,9 +502,25 @@ namespace
                     // Display sits below the header row, full width.
                     auto displayBounds = getLocalBounds().withZeroOrigin()
                                                      .reduced(kOuterPaddingX);
-                    displayBounds.setY(kOuterPaddingY + headerRowHeight + kGap);
+                    displayBounds.setY(
+                        kOuterPaddingY + headerRowHeight + kGap);
                     displayBounds.setHeight(spawn::ui::Display::kHeight);
                     display->setBounds(displayBounds);
+
+                    // SampleControls (placeholder knobs) sits below the
+                    // Display with a 16 px margin on all sides, matching
+                    // the rest of the app's outer padding rhythm. Full
+                    // width of the same horizontal area as the Display
+                    // (i.e. inset by kOuterPaddingX on left and right).
+                    // The component itself lays out its four placeholder
+                    // knobs evenly along the row.
+                    constexpr int kSampleControlsMargin = 16;
+                    auto sampleBounds = getLocalBounds().withZeroOrigin()
+                                                     .reduced(kOuterPaddingX, 0);
+                    sampleBounds.setY(displayBounds.getBottom()
+                                      + kSampleControlsMargin);
+                    sampleBounds.setHeight(spawn::ui::SampleControls::kHeight);
+                    sampleControls->setBounds(sampleBounds);
                 }
 
             private:
@@ -803,6 +852,32 @@ namespace
                         oldCuts, oldLength, oldFades,
                         trimStart, trimEnd, clamped);
                     waveformView->setClipFades(std::move(newFades));
+
+                    // 7) Re-detect BPM on the trimmed buffer. The user
+                    //    asked for this explicitly ("I also want the BPM
+                    //    to be recalculated on each 'trim' as its new
+                    //    audio"). We kick it off on the TempoInspector's
+                    //    worker; the result lands on the message
+                    //    thread and adopts into the Clock. No-op when
+                    //    TempoInspector or Clock is null.
+                    if (tempoInspector != nullptr && clock != nullptr)
+                    {
+                        auto trimmedBufferForDetect = trimmedBuffer;
+                        const double trimmedRateForDetect = trimmedRate;
+                        tempoInspector->detectAsync(
+                            trimmedBufferForDetect,
+                            trimmedRateForDetect,
+                            [this](double bpm, double /*confidence*/,
+                                   double secs)
+                            {
+                                if (clock == nullptr)
+                                    return;
+                                if (bpm > 0.0)
+                                    clock->adoptDetection(bpm, secs);
+                                if (masterControls != nullptr)
+                                    masterControls->syncFromClock();
+                            });
+                    }
                 }
 
                 // Shuffle the chops in the active region into a new random order
@@ -1030,9 +1105,19 @@ namespace
                 // to the engine.
                 void loadSampleAsync(const juce::File& file)
                 {
+                    // Try the WAV tempo-chunk path first — a quick
+                    // synchronous scan that gives us a confident BPM
+                    // for files DAWs exported with their BPM embedded.
+                    // If it returns std::nullopt (non-WAV, or a WAV
+                    // without a tempo chunk) we proceed to aubio's
+                    // statistical detection below.
+                    const auto wavBpm =
+                        spawn::dsp::WavTempoReader::readBpm(file);
+
                     decoder.decodeAsync(
                         file,
-                        [this, file](std::shared_ptr<spawn::audio::DecodedSample> sample)
+                        [this, file, wavBpm](
+                            std::shared_ptr<spawn::audio::DecodedSample> sample)
                         {
                             if (sample == nullptr || sample->buffer == nullptr)
                             {
@@ -1040,7 +1125,49 @@ namespace
                                     "Main: decode failed for " + file.getFullPathName());
                                 return;
                             }
-                            engine.setBuffer(sample->buffer, sample->sourceSampleRate);
+                            engine.setBuffer(sample->buffer,
+                                              sample->sourceSampleRate);
+
+                            // Push the WAV tempo-chunk BPM straight
+                            // into the Clock if we got one. Detection
+                            // still runs in case the file doesn't
+                            // expose a tempo chunk and the user wants
+                            // a computed value; if the chunk value
+                            // disagrees with aubio, the user can
+                            // override via the BPM editor.
+                            const double sourceSeconds =
+                                static_cast<double>(sample->buffer->getNumSamples())
+                                / sample->sourceSampleRate;
+                            if (clock != nullptr)
+                            {
+                                if (wavBpm.has_value())
+                                    clock->setBpm(*wavBpm);
+                                // Bars we let detection / the user
+                                // pick — we don't infer them from the
+                                // tempo chunk because the chunk
+                                // carries tempo, not bar count.
+
+                                // Hand the loaded buffer to the
+                                // TempoInspector for the statistical
+                                // pass. Its result lands on the
+                                // message thread via MessageManager and
+                                // adopts into the Clock.
+                                if (tempoInspector != nullptr)
+                                {
+                                    tempoInspector->detectAsync(
+                                        sample->buffer,
+                                        sample->sourceSampleRate,
+                                        [this](double bpm, double /*confidence*/, double secs)
+                                        {
+                                            if (clock == nullptr)
+                                                return;
+                                            if (bpm > 0.0)
+                                                clock->adoptDetection(bpm, secs);
+                                            if (masterControls != nullptr)
+                                                masterControls->syncFromClock();
+                                        });
+                                }
+                            }
                         });
                 }
 
@@ -1099,10 +1226,23 @@ namespace
                 std::unique_ptr<spawn::ui::ControlHeader> controlHeader;
                 std::unique_ptr<spawn::ui::Toolbar> toolbar;
                 std::unique_ptr<spawn::ui::Display> display;
+                std::unique_ptr<spawn::ui::MasterControls> masterControls;
                 std::unique_ptr<spawn::ui::SampleControls> sampleControls;
                 std::unique_ptr<spawn::ui::Transport> transport;
                 std::unique_ptr<spawn::ui::WaveformView> waveformView;
                 std::unique_ptr<juce::FileChooser> fileChooser;
+                // Project-level Clock: holds the active tempo (BPM)
+                // and bar count for the currently loaded audio. The
+                // Clock state is read by MasterControls (the header
+                // BPM/Bars editors), and is mutated by detection
+                // (on file load and after a trim) and by user
+                // edits in the editors.
+                std::unique_ptr<spawn::dsp::Clock> clock;
+                // Off-thread BPM detection. detectAsync kicks off an
+                // aubio tempo run on a single-thread pool and
+                // reports the result back to the message thread via
+                // a callback that adopts the result into the Clock.
+                std::unique_ptr<spawn::audio::TempoInspector> tempoInspector;
             };
 
             JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainWindow)

@@ -1,0 +1,64 @@
+// Spawn's aubio config.h — generated from cmake/SpawnAubio.cmake.
+//
+// We compile aubio single-precision (smpl_t = float), use the OOURA
+// FFT (the portable path in spectral/fft.c), and disable every
+// optional backend. We do NOT use aubio's I/O, effects, synth, or
+// pitch subsystems in Spawn v1 — those stay out of the build.
+
+#ifndef SPAWN_AUBIO_CONFIG_H
+#define SPAWN_AUBIO_CONFIG_H
+
+// All HAVE_* macros listed in aubio's config.h.cmake.in are defined
+// here as 0 (or undefined) so aubio_priv.h skips the optional headers
+// (fftw3, Accelerate, IPP, ATLAS, BLAS, complex.h-with-c99-macros).
+
+#cmakedefine HAVE_STDLIB_H 1
+#cmakedefine HAVE_STDIO_H 1
+
+// Complex.h: MSVC >= 16.10 ships a working <complex.h>. aubio's
+// aubio_priv.h uses it through a HAVE_COMPLEX_H gate. Enabling it
+// pulls in CEXPC/REAL/IMAG macros. We don't need those (aubio's
+// own MIN/MAX macros suffice for the spectral code paths we hit),
+// so leave it off to keep aubio_priv.h in its WIN32 manual-define
+// branch.
+#cmakedefine HAVE_MATH_H 1
+#cmakedefine HAVE_STRING_H 1
+#cmakedefine HAVE_ERRNO_H 1
+#cmakedefine HAVE_LIMITS_H 1
+#cmakedefine HAVE_STDARG_H 1
+
+// Optional backends — all disabled. We do NOT define these at all
+// so aubio_priv.h's `#ifdef` branches evaluate false. A bare
+// `#define X 0` would still resolve `#ifdef X` to true.
+#cmakedefine HAVE_FFTW3 0
+#cmakedefine HAVE_FFTW3F 0
+#cmakedefine HAVE_ACCELERATE 0
+#cmakedefine HAVE_INTEL_IPP 0
+#cmakedefine HAVE_ATLAS 0
+#cmakedefine HAVE_BLAS 0
+
+// Rubbed into aubio_priv.h's complex-number gate.
+#cmakedefine HAVE_C99_VARARGS_MACROS 0
+
+// MSVC's C compiler doesn't predefine NULL (it's a C++ thing).
+// Aubio's sources use NULL throughout. Define it here, BEFORE
+// aubio_priv.h gets the chance to set up. This is the cleanest
+// fix: NULL is a standard C macro that all aubio code paths
+// expect to exist.
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
+
+// va_list / vfprintf / FILE / stdout / stderr come from stdio.h
+// and stdarg.h, which aubio_priv.h pulls in. PCH plumbing in
+// MSVC's C compiler can drop those headers (the PCH state thinks
+// they've been processed). Force their inclusion as a safety
+// net whenever this header is included.
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <errno.h>
+
+#endif // SPAWN_AUBIO_CONFIG_H

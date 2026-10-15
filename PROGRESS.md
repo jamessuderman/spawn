@@ -39,6 +39,23 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - [ ] 4×4 pad grid (click → play slice)
 - [ ] Choke groups, mute/solo, mute groups
 
+### M1.5 — Tempo + bars foundation *(early M2 prerequisite)* 🟡
+
+- [x] **aubio vendored** at `third_party/aubio` (BSD). Wrapped via `cmake/SpawnAubio.cmake` — we build only the C sources needed for `aubio_tempo_t` + `aubio_onset_t` (tempo, beattracking, onset, peakpicker, spectral/fft + ooura, mathutils, vecutils, etc.) as a STATIC library, skipping aubio's I/O / effects / synth / pitch subsystems and all optional FFT backends (uses OOURA FFT). aubio's tree is staged into `build/<cfg>/aubio_stage/` so we can drop our own `config.h` next to `aubio_priv.h` without modifying the submodule.
+- [x] **`spawn::dsp::BpmDetector`** (`src/dsp/BpmDetector.{h,cpp}`) — wraps `aubio_tempo_t` with the CLI default 1024/256 window/hop. Returns `{bpm, confidence}` on success, bpm=0 on degenerate input. Mono float in.
+- [x] **`spawn::dsp::Clock`** (`src/dsp/Clock.{h,cpp}`) — observable BPM + bars per loaded sample. Clamps BPM to [40, 300] and bars to [1, 64]; defaults to 120/4. `adoptDetection(bpm, sourceSeconds)` infers an integer bar count. `expectedDurationSeconds()` does the 4/4 math. `onChanged` callback fires only on real changes.
+- [x] **`spawn::dsp::BarMath`** (`src/dsp/BarMath.{h,cpp}`) — pure free-function math `{lengthForBars, barsForLength}`. Will be reused by the M5 warper.
+- [x] **`spawn::dsp::WavTempoReader`** (`src/dsp/WavTempoReader.{h,cpp}`) — best-effort WAV tempo-chunk reader (recognises `tempo` / `LMTC` / `MIDI`; rejects out-of-range BPMs as corrupt). Acts as a hint ahead of `BpmDetector` for files that ship an embedded BPM.
+- [x] **Headless tests** — `tests/dsp_tests.cpp` covers BarMath round-trips, Clock clamp/diff/adoptDetection, BpmDetector on a 120 BPM synthesised click track (±10 BPM tolerance), and WavTempoReader happy path + corrupt-file heuristics.
+- [x] **Auto-detect BPM on import** — `loadSampleAsync` first consults `WavTempoReader` (synchronous WAV-tempo-chunk scan, BPM-only) and pushes it straight into the Clock if found, then hands the decoded buffer to `TempoInspector` for the aubio-based statistical pass. Result lands on the message thread via `MessageManager::callAsync` and adopts into the Clock via `Clock::adoptDetection`. `MasterControls::syncFromClock()` repaints the BPM/Bars editors.
+- [x] **`spawn::audio::TempoInspector`** (`src/audio/preview/TempoInspector.{h,cpp}`) — single-thread `juce::ThreadPool` worker that runs aubio detection off the message thread. Generation-counter cancellation mirrors `SampleDecoder`'s pattern: a newer `detectAsync` cancels any in-flight one (the stale result is dropped on the message thread).
+- [x] **Re-detect BPM on trim** — at the end of `trimOutsideMarkers`, the trimmed buffer is fed into `TempoInspector::detectAsync`. Same adopt-into-Clock + sync-up path as the import. The user explicitly asked: "I also want the BPM to be recalculated on each 'trim' as its new audio."
+- [x] **Layout reshuffle — MasterControls + SampleControls split.** Per James's M1.5 spec, `SampleControls` was renamed to `MasterControls` (it still holds the volume knob; the project kept the volume-knob location). The new `SampleControls` lives below the Display and holds four placeholder Knobs (no onChange wired yet) that reserve the slots for future per-sample DSP (filter / drive / envelope / etc.).
+- [x] **BPM + Bars editors inside MasterControls** — inline `Label` + `TextEditor` pairs sitting to the right of the volume knob in the header row. Editors are dark-ink, rounded, borderless (per spec). Mapped to the Clock via `MasterControls::setClock(clock)`; user edits commit on Return / focus loss.
+- [ ] Source drop-down / per-sample BPM override vs global project BPM
+- [ ] Warp MVP (per-sample stretch to target BPM; uses Rubber Band once vendored)
+- [ ] Rounded corners on the BPM and Bars editors (currently flat dark-ink rectangles — close to spec but the corner-radius bit is a follow-up)
+
 ### M3 — Envelopes + per-pad FX *(week 5)*
 
 - [ ] AHDSR envelope per slice
@@ -110,7 +127,8 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - **Waveform input no longer gates by tool** (M1 → M1): pan, zoom, marker drag, and double-click zoom-reset are always live on the `WaveformView`. The left-click-to-play gesture (Speaker) coexists via a 4 px click-vs-drag slack: a release within slack plays `[startSeconds, endSeconds]`; movement past slack commits to a drag and suppresses playback. Right-click anywhere stops playback. The `WaveformView::Tool` enum carries `{ Speaker, Scissors }`. The Move tool is removed from the waveform toolbar (only Speaker + Scissors + FolderOpen now) but the Move **button** stays on the sequencer toolbar as a placeholder.
 - **Scissors tool semantics** (M1 → M1): when Scissors is latched, the view hides its OS cursor and paints a 1 px ember vertical line at the current mouse x (full bounds height). Left-click adds a cut at the cursor into a sorted `std::vector<double>` of internal chop boundaries, dedup'd within `kMinChopGapSeconds` and clamped to (0, length). Pan / wheel-zoom / marker-drag stay live so the user can zoom in to place precise cuts without exiting the mode. The toolbar button on the waveform view is now wired: `Main.cpp` pushes the latched tool into `WaveformView::setActiveTool()` on selection and on initial / re-latch.
 - **Time-stretch**: TBD (Rubber Band default).
-- **Transient detection**: aubio (BSD).
+- **Transient detection**: aubio (BSD), vendored at `third_party/aubio` (git submodule). Wrapped via `cmake/SpawnAubio.cmake` — we build only the C sources needed for `aubio_tempo_t` (BPM) and `aubio_onset_t` (transient slicing, planned M2) as a STATIC library, skipping aubio's I/O / effects / synth / pitch subsystems and all optional FFT backends. Builds with the OOURA portable FFT, single-precision (`HAVE_AUBIO_DOUBLE=0`), with MSVC's NULL macro re-supplied via `config.h`.
+- **BPM detection**: aubio's tempo tracker (`aubio_tempo_t`, 1024/256 window/hop, defaults matching `aubio beat` CLI). Returns `{bpm, confidence}`. v1 wraps it as `spawn::dsp::BpmDetector`; v2 may add transient slicing on the same library once M2 begins.
 - **License (source)**: TBD (MIT / dual).
 - **License (product)**: TBD (free / freemium / one-time / subscription).
 - **Open-source model**: TBD.

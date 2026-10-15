@@ -22,6 +22,8 @@
 #include "../src/waveform/ClipFadeRemap.h"
 #include "../src/waveform/WaveformView.h"
 
+#include "TestHelpers.h"
+
 using spawn::audio::PreviewEngine;
 using spawn::ui::Palette;
 using spawn::ui::SettingsStore;
@@ -94,16 +96,8 @@ juce::File writeSilentWav(const juce::File& dir)
     return out;
 }
 
-// Unique temp dir for each test so parallel test invocations don't
-// step on each other's WAV files.
-juce::File makeTempDir(const juce::String& tag)
-{
-    auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
-        .getChildFile("spawn_waveform_test_" + tag + "_"
-                      + juce::String(juce::Random::getSystemRandom().nextInt64()));
-    dir.createDirectory();
-    return dir;
-}
+// makeTempDir lives in tests/TestHelpers.h so other test files can
+// share it (e.g. dsp_tests.cpp's WavTempoReader tests).
 
 // Build a stereo buffer holding a constant sample on each channel —
 // mirror of preview_engine_tests.cpp's helper, duplicated here so the
@@ -134,7 +128,7 @@ public:
         // so Palette's load() doesn't try to write to the user's
         // actual config dir during a test run. The file is recreated
         // per run; Palette only reads from it on construction.
-        auto settingsFile = makeTempDir("settings").getChildFile("settings.properties");
+        auto settingsFile = spawn_test::makeTempDir("settings").getChildFile("settings.properties");
         SettingsStore store(settingsFile);
 
         {
@@ -191,7 +185,7 @@ public:
             // addCut needs a non-zero sample length, so we load a
             // real file. The silent 1 s WAV gives us predictable
             // boundaries to test against.
-            auto dir = makeTempDir("readd");
+            auto dir = spawn_test::makeTempDir("readd");
             const auto file = writeSilentWav(dir);
 
             Palette palette(store);
@@ -221,7 +215,7 @@ public:
         {
             // Load a real sample so findChopAt has a non-zero
             // length to compute against. Silent 1 s WAV at 44.1 kHz.
-            auto dir = makeTempDir("merge");
+            auto dir = spawn_test::makeTempDir("merge");
             const auto file = writeSilentWav(dir);
 
             Palette palette(store);
@@ -313,11 +307,11 @@ public:
         // Each test loads a silent 1 s WAV so addCut and
         // setSelectedClip have a non-zero length to work with. Uses
         // the same fixture as the cut-list tests.
-        auto settingsFile = makeTempDir("settings_sel").getChildFile("settings.properties");
+        auto settingsFile = spawn_test::makeTempDir("settings_sel").getChildFile("settings.properties");
         SettingsStore store(settingsFile);
 
         {
-            auto dir = makeTempDir("sel_start");
+            auto dir = spawn_test::makeTempDir("sel_start");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -335,7 +329,7 @@ public:
         }
 
         {
-            auto dir = makeTempDir("sel_end");
+            auto dir = spawn_test::makeTempDir("sel_end");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -353,7 +347,7 @@ public:
         }
 
         {
-            auto dir = makeTempDir("sel_neither");
+            auto dir = spawn_test::makeTempDir("sel_neither");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -377,7 +371,7 @@ public:
         }
 
         {
-            auto dir = makeTempDir("sel_empty");
+            auto dir = spawn_test::makeTempDir("sel_empty");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -404,7 +398,7 @@ public:
             // leave the selection spanning [0, length] — the chop
             // the selection refers to has merged with its only
             // neighbour.
-            auto dir = makeTempDir("sel_only");
+            auto dir = spawn_test::makeTempDir("sel_only");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -433,7 +427,7 @@ public:
             // startSeconds/endSeconds. If it reads the length async,
             // endSeconds would be 0 here and a follow-up drag would
             // not be able to move markers past 0.
-            auto dir = makeTempDir("sync_len");
+            auto dir = spawn_test::makeTempDir("sync_len");
             const auto file = writeSilentWav(dir); // 1 s, 44.1 kHz
             Palette palette(store);
             WaveformView view(palette);
@@ -456,7 +450,7 @@ public:
             //   5. view's startSeconds/endSeconds must reflect 0.5 s
             // If step 5 fails (e.g. (0, 0)), the next drag would have
             // no usable range and a follow-up trim would degenerate.
-            auto dir = makeTempDir("trim_reload");
+            auto dir = spawn_test::makeTempDir("trim_reload");
             const auto temp = dir.getChildFile("spawn-trim-rewrite.wav");
 
             PreviewEngine engine;
@@ -549,7 +543,7 @@ public:
             // internal cut and re-select the full region, leaving
             // start/end markers untouched. After clearing, the
             // model should look like a freshly-loaded sample.
-            auto dir = makeTempDir("clear_cuts");
+            auto dir = spawn_test::makeTempDir("clear_cuts");
             const auto file = writeSilentWav(dir); // 1 s, 44.1 kHz
             Palette palette(store);
             WaveformView view(palette);
@@ -594,7 +588,7 @@ public:
             // harmless — no crash, no spurious repaint side effects,
             // and the selection stays as it was (which is the full
             // region by default).
-            auto dir = makeTempDir("clear_cuts_noop");
+            auto dir = spawn_test::makeTempDir("clear_cuts_noop");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -624,7 +618,7 @@ public:
             // middle cut through several positions. Each drag
             // event hits the erase/insert path. Without the fix,
             // the second or third drag event trips the assertion.
-            auto dir = makeTempDir("cut_drag_regression");
+            auto dir = spawn_test::makeTempDir("cut_drag_regression");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -678,7 +672,7 @@ public:
             // icon hit zones. Each clip is ~25% of the visible width,
             // so the icon should land in the rightmost ~16 px of
             // each slice.
-            auto dir = makeTempDir("hit_lock");
+            auto dir = spawn_test::makeTempDir("hit_lock");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -728,7 +722,7 @@ public:
             // erase/insert entirely. Must not trip the iterator
             // check either (it didn't before, but make sure the
             // fix doesn't regress this path).
-            auto dir = makeTempDir("cut_drag_noop");
+            auto dir = spawn_test::makeTempDir("cut_drag_noop");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -759,7 +753,7 @@ public:
             // Lock vector must always be cuts.size() + 1. Add a
             // cut, then a cut, then a cut — the lock vector grows
             // alongside. Remove a cut, it shrinks.
-            auto dir = makeTempDir("lock_basic");
+            auto dir = spawn_test::makeTempDir("lock_basic");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -801,7 +795,7 @@ public:
             // applyMarkerDrag(Cut) doesn't change cuts.size(), so
             // the lock vector stays the same size. Lock at index 1
             // stays at index 1.
-            auto dir = makeTempDir("lock_drag");
+            auto dir = spawn_test::makeTempDir("lock_drag");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -837,7 +831,7 @@ public:
         {
             // After clearCuts the buffer is one big chop. Lock
             // vector should have exactly one entry (default false).
-            auto dir = makeTempDir("lock_clear");
+            auto dir = spawn_test::makeTempDir("lock_clear");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -857,7 +851,7 @@ public:
         beginTest("clip locks: reloadFromBuffer resets locks "
                   "(new buffer means old lock pattern is meaningless)");
         {
-            auto dir = makeTempDir("lock_reload");
+            auto dir = spawn_test::makeTempDir("lock_reload");
             const auto file = writeSilentWav(dir);
             Palette palette(store);
             WaveformView view(palette);
@@ -912,7 +906,7 @@ public:
         engine.prepareToPlay(256, 48000.0);
         engine.setGain(1.0f);
 
-        auto settingsFile = makeTempDir("regression_settings")
+        auto settingsFile = spawn_test::makeTempDir("regression_settings")
                                 .getChildFile("settings.properties");
         SettingsStore store(settingsFile);
         Palette palette(store);
@@ -928,7 +922,7 @@ public:
                     engine.setPlayWindow(startSec, endSec);
             });
 
-        auto dir = makeTempDir("regression_file");
+        auto dir = spawn_test::makeTempDir("regression_file");
         const auto file = writeSilentWav(dir); // 1 s at 44.1 kHz
         expect(view.loadFile(file));
 
@@ -1054,7 +1048,7 @@ public:
             // No cuts, so the single clip is [startSeconds, endSeconds]
             // which both default to 0. Use a loaded file to get a
             // non-zero length.
-            auto dir = makeTempDir("fade_clamp");
+            auto dir = spawn_test::makeTempDir("fade_clamp");
             const auto file = writeSilentWav(dir);
             expect(view.loadFile(file));
             // Sample is 1 second. Set fade-in to 10 seconds — should
@@ -1102,7 +1096,7 @@ public:
             SettingsStore store;
             Palette palette(store);
             WaveformView view(palette);
-            auto dir = makeTempDir("apply_fade");
+            auto dir = spawn_test::makeTempDir("apply_fade");
             const auto file = writeSilentWav(dir);
             expect(view.loadFile(file));
             // 1-second sample, single clip [0, 1]. No cuts.
@@ -1253,4 +1247,5 @@ static WaveformViewChopDragDuringPlaybackRegression
     waveformViewChopDragDuringPlaybackRegression;
 static WaveformViewClipFadeTests waveformViewClipFadeTests;
 static ClipFadeRemapTests clipFadeRemapTests;
+
 

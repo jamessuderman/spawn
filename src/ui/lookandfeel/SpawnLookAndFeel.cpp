@@ -36,6 +36,19 @@ SpawnLookAndFeel::SpawnLookAndFeel(Palette& paletteRef)
     setColour(juce::PopupMenu::headerTextColourId, paletteRef.labelText());
     setColour(juce::PopupMenu::highlightedBackgroundColourId, paletteRef.primary());
     setColour(juce::PopupMenu::highlightedTextColourId, paletteRef.ink());
+
+    // Text selection highlight — fill in the app primary, text in ink so
+    // the selection reads as "ember on dark" matching the rest of the UI
+    // rather than the JUCE default blue. Applies to every TextEditor in
+    // the app; individual editors can still override per-component.
+    setColour(juce::TextEditor::highlightColourId, paletteRef.primary());
+    setColour(juce::TextEditor::highlightedTextColourId, paletteRef.ink());
+
+    // Text caret — in the app primary so the cursor in the BPM/Bars
+    // editors reads as part of the same ember accent as the volume
+    // knob's value arc, the scissors cursor, and the selection
+    // highlight above. Without this override JUCE defaults to blue.
+    setColour(juce::CaretComponent::caretColourId, paletteRef.primary());
 }
 
 SpawnLookAndFeel::~SpawnLookAndFeel() = default;

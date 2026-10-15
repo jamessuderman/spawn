@@ -7,6 +7,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(SPAWN_BUILD_STANDALONE "Build Spawn as a standalone application" ON)
 option(SPAWN_BUILD_VST3 "Build Spawn as a VST3 plugin" OFF)
+option(SPAWN_WITH_AUBIO "Build with aubio BPM + onset detection" ON)
+
+# aubio (vendored as a git submodule at third_party/aubio). We build
+# only the subset we need (tempo + onset + supporting spectral/types),
+# as documented in cmake/SpawnAubio.cmake. Adding aubio here makes the
+# `spawn_aubio` static library available to both SpawnStandalone and
+# SpawnTests; the BpmDetector module picks it up via target_link_libraries.
+if(SPAWN_WITH_AUBIO)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SpawnAubio.cmake")
+endif()
 
 # JUCE (vendored as a git submodule at third_party/JUCE)
 set(JUCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/JUCE" CACHE PATH "Path to the JUCE source tree")
@@ -85,9 +95,11 @@ if(SPAWN_BUILD_STANDALONE)
             src/audio/preview/AudioDeviceHolder.cpp
             src/audio/preview/PreviewEngine.cpp
             src/audio/preview/SampleDecoder.cpp
+            src/audio/preview/TempoInspector.cpp
             src/controlheader/ControlHeader.cpp
             src/controlheader/DisplayButton.cpp
             src/display/Display.cpp
+            src/samplecontrols/MasterControls.cpp
             src/samplecontrols/SampleControls.cpp
             src/sequencer/SequencerView.cpp
             src/toolbar/Toolbar.cpp
@@ -104,6 +116,10 @@ if(SPAWN_BUILD_STANDALONE)
             src/ui/knob/Knob.cpp
             src/ui/lookandfeel/Palette.cpp
             src/ui/lookandfeel/SpawnLookAndFeel.cpp
+            src/dsp/BarMath.cpp
+            src/dsp/BpmDetector.cpp
+            src/dsp/Clock.cpp
+            src/dsp/WavTempoReader.cpp
             src/waveform/ClipFadeRemap.cpp
             src/waveform/WaveformView.cpp)
 
@@ -111,6 +127,16 @@ if(SPAWN_BUILD_STANDALONE)
         PRIVATE
             JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SpawnStandalone,JUCE_PRODUCT_NAME>"
             JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SpawnStandalone,JUCE_VERSION>")
+
+    # Add the project's source tree as an include path so files
+    # in subdirectories can refer to other modules by their
+    # project-relative path (e.g. #include "dsp/Clock.h" from
+    # src/audio/preview/TempoInspector.cpp). This mirrors the way
+    # files at the top of the tree (src/Main.cpp) already resolve
+    # the same include via their own source-relative search.
+    target_include_directories(SpawnStandalone PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
 
     target_link_libraries(SpawnStandalone
         PRIVATE
@@ -124,6 +150,15 @@ if(SPAWN_BUILD_STANDALONE)
             juce::juce_recommended_config_flags
             juce::juce_recommended_lto_flags
             juce::juce_recommended_warning_flags)
+
+    # aubio links with the platform math library; MSVC doesn't
+    # ship one by default but Linux/macOS do.
+    if(SPAWN_WITH_AUBIO)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(SpawnStandalone PRIVATE m)
+        endif()
+        target_link_libraries(SpawnStandalone PRIVATE spawn_aubio)
+    endif()
 endif()
 
 # VST3 plugin (skeleton wired but off by default)
@@ -148,8 +183,14 @@ if(SPAWN_BUILD_TESTS)
             tests/preview_engine_tests.cpp
             tests/sample_decoder_tests.cpp
             tests/waveform_view_tests.cpp
+            tests/dsp_tests.cpp
             src/audio/preview/PreviewEngine.cpp
             src/audio/preview/SampleDecoder.cpp
+            src/audio/preview/TempoInspector.cpp
+            src/dsp/BarMath.cpp
+            src/dsp/BpmDetector.cpp
+            src/dsp/Clock.cpp
+            src/dsp/WavTempoReader.cpp
             src/stores/SettingsStore.cpp
             src/ui/fonts/Fonts.cpp
             src/ui/icons/Icon.cpp
@@ -171,6 +212,20 @@ if(SPAWN_BUILD_TESTS)
             juce::juce_recommended_config_flags
             juce::juce_recommended_lto_flags
             juce::juce_recommended_warning_flags)
+
+    # Mirror SpawnStandalone's include layout so that test-side
+    # files in subdirectories can use the same project-relative
+    # paths as production code.
+    target_include_directories(SpawnTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    if(SPAWN_WITH_AUBIO)
+        if(UNIX AND NOT APPLE)
+            target_link_libraries(SpawnTests PRIVATE m)
+        endif()
+        target_link_libraries(SpawnTests PRIVATE spawn_aubio)
+    endif()
 
     enable_testing()
     add_test(NAME SpawnTests
