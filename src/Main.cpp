@@ -276,6 +276,19 @@ namespace
                     // the editors right away.
                     masterControls->syncFromClock();
 
+                    // Wire the Clock -> engine. Whenever the user
+                    // commits a BPM edit (or detection adopts a new
+                    // value into the Clock) the engine re-stretches
+                    // the loaded audio through WSOLA so the playback
+                    // tempo matches the editor. Bars changes don't
+                    // trigger a re-bake — they only change the play
+                    // window length, which the engine reads from the
+                    // editor indirectly via Clock::expectedDuration.
+                    clock->onChanged = [this]
+                    {
+                        engine.setTargetBpm(clock->bpm());
+                    };
+
                     // Transport buttons drive the PreviewEngine from the
                     // header row. Play resumes from the engine's current
                     // playhead (posSample) — whatever it is at the time
@@ -295,7 +308,38 @@ namespace
                         if (waveformView == nullptr || !engine.hasBuffer())
                             return;
                         const double start = engine.getCurrentPositionSeconds();
-                        const double end   = waveformView->getEndSeconds();
+                        // The end of the play window comes from the
+                        // project Clock (the BPM/Bars editors in the
+                        // header), not the waveform's end marker.
+                        // expectedDurationSeconds() = bars * 4 beats
+                        // at the current BPM, in 4/4. We clamp the
+                        // result to the loaded buffer's extent so the
+                        // engine never asks to play past the end —
+                        // otherwise the audio thread runs into silence
+                        // and playFrom() silently clamps anyway, but a
+                        // small requested end past buffer.end is
+                        // cleaner than deliberately oversized.
+                        double end = (clock != nullptr)
+                            ? clock->expectedDurationSeconds()
+                            : 0.0;
+                        if (end <= start)
+                            return;
+                        // Cap end at the loaded buffer length.
+                        const auto bufferSnapshot = engine.getBufferSnapshot();
+                        if (bufferSnapshot != nullptr)
+                        {
+                            const double sourceRate =
+                                engine.getSourceSampleRate();
+                            if (sourceRate > 0.0)
+                            {
+                                const double bufferSeconds =
+                                    static_cast<double>(
+                                        bufferSnapshot->getNumSamples())
+                                    / sourceRate;
+                                if (bufferSeconds > 0.0)
+                                    end = juce::jmin(end, bufferSeconds);
+                            }
+                        }
                         if (end <= start)
                             return;
                         engine.playFrom(start, end);
@@ -1125,8 +1169,6 @@ namespace
                                     "Main: decode failed for " + file.getFullPathName());
                                 return;
                             }
-                            engine.setBuffer(sample->buffer,
-                                              sample->sourceSampleRate);
 
                             // Push the WAV tempo-chunk BPM straight
                             // into the Clock if we got one. Detection
@@ -1138,14 +1180,45 @@ namespace
                             const double sourceSeconds =
                                 static_cast<double>(sample->buffer->getNumSamples())
                                 / sample->sourceSampleRate;
+                            double initialBpm = 0.0;
                             if (clock != nullptr)
                             {
                                 if (wavBpm.has_value())
                                     clock->setBpm(*wavBpm);
+                                else if (clock->bpm() > 0.0)
+                                    initialBpm = clock->bpm();
                                 // Bars we let detection / the user
                                 // pick — we don't infer them from the
                                 // tempo chunk because the chunk
                                 // carries tempo, not bar count.
+                            }
+
+                            // Hand the buffer to the engine with the
+                            // initial source BPM. setSourceBuffer
+                            // re-stretches the buffer through WSOLA
+                            // to the engine's target BPM (which
+                            // tracks the Clock) so the engine plays
+                            // the file at the tempo the user has
+                            // picked before aubio detection has had
+                            // a chance to re-detect. initialBpm == 0
+                            // short-circuits to identity and the
+                            // audio plays at its native tempo until
+                            // the first setTargetBpm fires.
+                            const double sourceBpmForEngine =
+                                (wavBpm.has_value()) ? *wavBpm
+                                : (initialBpm > 0.0) ? initialBpm
+                                : 0.0;
+                            engine.setSourceBuffer(sample->buffer,
+                                                    sample->sourceSampleRate,
+                                                    sourceBpmForEngine);
+                            // Snap the engine's target to whatever the
+                            // Clock already displays so an explicit
+                            // 120 BPM editor value plays the audio at
+                            // 120, regardless of what we just stored
+                            // as sourceBpm.
+                            if (clock != nullptr)
+                            {
+                                engine.setTargetBpm(clock->bpm());
 
                                 // Hand the loaded buffer to the
                                 // TempoInspector for the statistical

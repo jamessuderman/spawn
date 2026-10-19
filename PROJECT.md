@@ -36,6 +36,51 @@ This is the working "we got this from X" ledger. When a feature ships, the file 
   embedded or referenced samples — see `v1 scope`). Mimic's
   `.patch`/`-chunk` model is the closest analog in product behaviour.
 
+### Apple Logic Pro Quick Sampler — biggest influence in M2
+
+Surface parity was the explicit ask for M2 (2026-10-19). The
+deliberate framing: Quick Sampler is a **focused sub-mode** that
+sits inside Spawn's broader chops-first scope, not a competing
+product. We borrow its surface, not its identity.
+
+What we copy:
+
+- **Single-voice, full-pane waveform**: matches QS's "one sample,
+  one waveform." Pad triggering and polyphony live in M3's
+  Performance mode.
+- **Four slice modes**: Off, Transients (aubio onset), Quick
+  (BPM-driven fixed slice count), Optimized (transients-when-
+  confident, grid-otherwise). Names held verbatim from QS.
+- **Right-rail module panel** with eight groups: Tone / Pitch /
+  Filter / EQ / Envelope / Amp / Pan / Loop. The panel is the
+  singular entry point for FX — no insert chain, no rack reorder.
+- **Per-slice overrides** that fall back to the sample-level
+  state when no override is set. A "↺ All" / global selector
+  drives the knob binding.
+- **Loop region on the waveform**: dashed brackets match QS's
+  visual. Crossfade + Forward / Back & Forth modes are the
+  literal implementation.
+- **Full ADSR** rendered as a line/curve display in the panel
+  (matches QS's "Envelope" view — not the 2-knob AR of the
+  manual, full ADSR for power users). The curve updates in real
+  time as the user drags handles.
+
+What we **don't** copy:
+
+- **Drag-and-record into the sample** (QS records from a chosen
+  input onto a fresh buffer). Out of v1 — would need an audio-
+  in path into SampleDecoder and a separate recording-model
+  surface. Targeted for v2.
+- **Drag-to-track** in the standalone build. The standalone has
+  no "track" to drop into. The M2 surface substitutes a
+  project-level "Extract" action (saves the current sample +
+  selected slice + overrides as a new `.spawnproj`).
+- **Round-robin / random / velocity-stack layers per pad**. The
+  M2 model is single-sample-per-pad by design. M3 inherits the
+  M2 layered feature from Battery when it lands.
+- **Polyphonic pitch shifting / scale locking**. Battery / Maschine
+  territory.
+
 ### Akai MPC — chops-first, hardware-feel paddding, beat templating
 
 - **Scissors → instant cut**: we mirror MPC's mode where the click
@@ -126,15 +171,17 @@ learn what actually feels right in the app.
 
 - Standalone + VST3 (Windows, macOS)
 - Drag-drop import: WAV / AIFF / MP3 / FLAC / OGG / OPUS
-- Slicing modes: manual, grid, transient, learn (auto)
-- Per-slice pads with choke groups, mute groups
-- Time-stretch (with pitch preserved) and warp (beat-locked)
-- ADSR (AHDSR) amplitude envelope per slice
-- Per-pad effects chain (filter, LFO, drive, sends)
-- Master effects chain (EQ, compressor, reverb, delay, limiter)
-- Step sequencer (16 / 32 steps, multi-track, per-track length)
-- Transport sync: MIDI clock in/out, internal clock
-- Project save/load: `.spawnproj` (JSON + sample cache)
+- Slicing modes: **Off / Transients / Quick / Optimized** (the Quick Sampler set, in that wording)
+- Per-sample effects chain (Tone → Filter → EQ → Envelope → Drive → Reverb → Pan), single voice, no chain reorder
+- Loop region on the waveform (Forward + Back & Forth with crossfade)
+- Per-slice overrides (overridable fields: Tone, Pitch, Filter, EQ, Envelope, Drive, Reverb, Pan, Loop). Defaults inherit from the global Kit FX.
+- Per-pad performance surface (4×4 default, configurable) — M3
+- Per-pad effects chain (filter, LFO, drive, sends) — M3
+- Master effects chain (EQ, compressor, reverb, delay, limiter) — M4
+- Time-stretch (with pitch preserved) and warp (beat-locked) — M5
+- Step sequencer (16 / 32 steps, multi-track, per-track length) — M6
+- Transport sync: MIDI clock in/out, internal clock — M7
+- Project save/load: `.spawnproj` (JSON + sample cache, embedded by default with "External" toggle)
 - Theme system (light / dark + accent swap)
 
 ## v1 stretch (target if time permits)

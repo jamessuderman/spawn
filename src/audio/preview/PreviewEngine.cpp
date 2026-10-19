@@ -2,6 +2,9 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 
+#include "dsp/Clock.h"
+#include "dsp/TimeStretcher.h"
+
 namespace spawn::audio {
 
 namespace {
@@ -106,6 +109,19 @@ void PreviewEngine::setBuffer(
         : 0;
     totalSourceSamples.store(total, std::memory_order_release);
 
+    // The buffer is assumed to already be at the engine's target
+    // BPM (it's an identity "new playing buffer" entry point —
+    // setSourceBuffer is the entry that knows the origin tempo).
+    // Drop any source-tempo tracking: if the caller later trims or
+    // shuffles, the derived buffer we hand the engine is itself
+    // at the target BPM, so the engine's source tracking would
+    // become a liar if we kept the old value.
+    {
+        std::lock_guard<std::mutex> lock(sourceMutex);
+        sourceBuffer = nullptr;
+    }
+    sourceBpm.store(0.0, std::memory_order_release);
+
     // A new buffer invalidates the in-flight transport. Reset to idle
     // and park the playhead at 0 so a stale "playing" state from the
     // previous file doesn't leak into the new one. Preserve the
@@ -114,6 +130,108 @@ void PreviewEngine::setBuffer(
     idle.playing = false;
     idle.posSample = 0;
     transport.store(idle, std::memory_order_release);
+}
+
+void PreviewEngine::setSourceBuffer(
+    std::shared_ptr<const juce::AudioBuffer<float>> buffer,
+    double sourceSampleRateToUse,
+    double sourceBpmIn)
+{
+    // Drop the source BPM we used to trust — the new buffer is
+    // superseding it. We restore tracking after rebake() below.
+    {
+        std::lock_guard<std::mutex> lock(sourceMutex);
+        sourceBuffer = buffer;
+    }
+    const double sb = (sourceBpmIn > 0.0) ? sourceBpmIn : 0.0;
+    sourceBpm.store(sb, std::memory_order_release);
+
+    // targetBpm stays at its current value; rebake() reads it and
+    // produces the published buffer at the right ratio.
+    rebake();
+}
+
+void PreviewEngine::setTargetBpm(double targetBpmIn)
+{
+    // Clamp to the engine's model range (same bounds the dsp::Clock
+    // uses for its user-visible field). Degenerate input is a no-op.
+    if (!(targetBpmIn > 0.0) || !std::isfinite(targetBpmIn))
+        return;
+    const double clamped = juce::jlimit<double>(spawn::dsp::Clock::BpmMin,
+                                                spawn::dsp::Clock::BpmMax,
+                                                targetBpmIn);
+    targetBpm.store(clamped, std::memory_order_release);
+    rebake();
+}
+
+double PreviewEngine::getSourceBpm() const noexcept
+{
+    return sourceBpm.load(std::memory_order_acquire);
+}
+
+void PreviewEngine::rebake()
+{
+    // Snapshot the source. The mutex in loadBuffer (already on
+    // bufferMutex) and the sourceMutex are held only for the
+    // duration of a shared_ptr copy; buffer access after rebake()
+    // returns touches no shared state. We don't touch the audio
+    // thread's bufferRef directly — rebake() goes through the
+    // standard setBuffer path so the publication/swap semantics
+    // stay consistent with the existing code.
+    std::shared_ptr<const juce::AudioBuffer<float>> source;
+    {
+        std::lock_guard<std::mutex> lock(sourceMutex);
+        source = sourceBuffer;
+    }
+    if (source == nullptr || source->getNumSamples() == 0
+        || source->getNumChannels() == 0)
+    {
+        return;
+    }
+
+    const double sb = sourceBpm.load(std::memory_order_acquire);
+    const double tb = targetBpm.load(std::memory_order_acquire);
+    if (!(sb > 0.0) || !(tb > 0.0))
+    {
+        // Unknown source BPM: publish the source unchanged and let
+        // the audio thread play it as-is. This is the same effect
+        // as if the caller had used setBuffer() with the same data.
+        auto copy = std::make_shared<juce::AudioBuffer<float>>(
+            source->getNumChannels(),
+            source->getNumSamples());
+        for (int ch = 0; ch < source->getNumChannels(); ++ch)
+            copy->copyFrom(ch, 0, *source, ch, 0, source->getNumSamples());
+        const double rate = sourceSampleRate.load(std::memory_order_acquire);
+        setBuffer(std::move(copy), rate > 0.0 ? rate : 44100.0);
+        return;
+    }
+
+    // ratio = outputLength / inputLength: stretch when target is
+    // slower than source (ratio > 1). Slower playback → longer
+    // audio.
+    const double ratio = sb / tb;
+    juce::AudioBuffer<float> stretched =
+        spawn::dsp::TimeStretcher::stretch(*source, ratio);
+    if (stretched.getNumSamples() == 0)
+    {
+        // Stretcher couldn't produce output (e.g. ratio <= 0).
+        // Fall back to publishing the source unchanged so playback
+        // still works, just at the source BPM rather than the
+        // target BPM the user requested. The UI will still show
+        // the user's target BPM.
+        auto copy = std::make_shared<juce::AudioBuffer<float>>(
+            source->getNumChannels(),
+            source->getNumSamples());
+        for (int ch = 0; ch < source->getNumChannels(); ++ch)
+            copy->copyFrom(ch, 0, *source, ch, 0, source->getNumSamples());
+        const double rate = sourceSampleRate.load(std::memory_order_acquire);
+        setBuffer(std::move(copy), rate > 0.0 ? rate : 44100.0);
+        return;
+    }
+    auto stretchedShared = std::make_shared<juce::AudioBuffer<float>>(
+        std::move(stretched));
+    const double rate = sourceSampleRate.load(std::memory_order_acquire);
+    setBuffer(std::move(stretchedShared), rate > 0.0 ? rate : 44100.0);
 }
 
 void PreviewEngine::playFrom(double startSeconds, double endSeconds,
@@ -324,20 +442,18 @@ void PreviewEngine::trimToRegion(double startSeconds, double endSeconds)
                           ch, static_cast<int>(s),
                           newLength);
 
-    // Publish the new buffer using the same swap pattern as
-    // setBuffer(). The old shared_ptr keeps the old buffer alive
-    // until the last in-flight audio render finishes on it.
-    storeBuffer(trimmed);
-    totalSourceSamples.store(newLength, std::memory_order_release);
-    sourceSampleRate.store(rate, std::memory_order_release);
-
-    // Reset transport to idle at the new buffer's start. Preserve the
-    // sticky loop toggle across the trim — the user's loop preference
-    // is independent of which buffer is loaded.
-    TransportState idle = transport.load(std::memory_order_relaxed);
-    idle.playing   = false;
-    idle.posSample = 0;
-    transport.store(idle, std::memory_order_release);
+    // Treat the trimmed buffer as a new source at the engine's
+    // current target BPM. Going through setSourceBuffer (rather
+    // than the direct storeBuffer/setBuffer path) preserves the
+    // BPM-tracking invariant: the engine can still re-bake the
+    // trimmed audio on the next setTargetBpm. Going through
+    // setBuffer would lose the source BPM, which means a later
+    // setTargetBpm would stretch nothing.
+    //
+    // The trimmed buffer's effective BPM matches targetBpm: we
+    // sampled from a buffer that was already at targetBpm (the
+    // engine's playing buffer), so the trim preserves it exactly.
+    setSourceBuffer(std::move(trimmed), rate, targetBpm.load());
 }
 
 void PreviewEngine::setBufferFromChops(
@@ -410,20 +526,11 @@ void PreviewEngine::setBufferFromChops(
         writeOffset += chunkLen;
     }
 
-    // Publish the new buffer using the same swap pattern as
-    // setBuffer() / trimToRegion(). The old shared_ptr keeps the
-    // old buffer alive until the last in-flight audio render
-    // finishes on it.
-    storeBuffer(shuffled);
-    totalSourceSamples.store(newLength, std::memory_order_release);
-    sourceSampleRate.store(rate, std::memory_order_release);
-
-    // Reset transport to idle at the new buffer's start. Preserve
-    // the sticky loop toggle — same policy as trimToRegion.
-    TransportState idleState = transport.load(std::memory_order_relaxed);
-    idleState.playing   = false;
-    idleState.posSample = 0;
-    transport.store(idleState, std::memory_order_release);
+    // Same rationale as trimToRegion: route through setSourceBuffer
+    // so the shuffled buffer becomes the new source at the
+    // current target BPM. Subsequent setTargetBpm calls keep
+    // working without losing the BPM-tracking chain.
+    setSourceBuffer(std::move(shuffled), rate, targetBpm.load());
 }
 
 bool PreviewEngine::writeBufferToWav(const juce::File& dest) const

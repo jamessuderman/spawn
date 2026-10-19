@@ -37,14 +37,58 @@ Two products, one core. The **Spawn Core** is a static library that holds the au
 
 ### `core/model/` — Pure data, JSON-serializable
 
-- `Sample` — file path, sample rate, length, channel count, pitch info
-- `Slice` — start/end, fade in/out, pitch, detune, pan, gain, choke group, mute group
-- `Pad` — assigned Sample, slice index, per-pad settings (envelope, FX, sends)
-- `PadBank` — 4×4 / 4×8 grid of pads
-- `Kit` — one bank + global settings (master FX, choke groups, MIDI map)
-- `Track` — pattern lane, mute/solo, FX sends
-- `Pattern` — array of tracks × per-step triggers (note, velocity, micro-timing)
-- `Project` — kit + patterns + transport + master chain
+> **M2 introduces a per-slice override model.** Most FX fields on `Sample` / `Kit` carry a parallel per-slice override that inherits from the global value when its `enabled` flag is false. This is the single most important data-model change in M2.
+
+- `Sample` — file path, sample rate, length, channel count, root note, fine tune, pitch semitones
+- `Envelope` — attack / decay / sustain / release (full ADSR — see PROGRESS.md § M2 decisions)
+- `LoopRegion` — start / length / crossfade / mode (`Off`, `Forward`, `BackAndForth`)
+- `SliceOverrides` — `enabled` toggles plus every overridable FX field (envelope, pitchSemitones, tone, filter, eq {low, mid, high}, reverbMix, driveDb, pan, loopRegion); a slice that didn't opt in inherits the global value.
+- `Slice` — id, source start/end, fade in/out, `SliceOverrides`
+- `Pad` — assigned Slice, per-pad settings (envelope, FX, sends) *(M3 — placeholder in M2)*
+- `PadBank` — 4×4 / 4×8 grid of pads + `Mode { Slice, Performance }` *(M3 placeholder; M2 ships Slice mode only)*
+- `Kit` — sample, slices, global FX state (`tone`, `filter`, `eq`, `envelope`, `reverbMix`, `driveDb`, `pan`, `loop`, `masterGain`), MIDI map *(M7 stretch)*, choke groups *(M3)*
+- `Project` — Kit + transport + master chain + `.spawnproj` I/O state
+- `Pattern`, `Track` — *(M6)*
+
+### FX override resolution
+
+At render time the engine resolves the **effective FX state** for a slice:
+
+```cpp
+FxParams resolveEffective(Kit& kit, Slice& slice) {
+  FxParams g = kit.globalFx;        // global
+  FxParams s = slice.overrides;     // per-slice
+  FxParams out;
+  out.tone        = s.enabled.tone        ? s.tone        : g.tone;
+  out.filter      = s.enabled.filter      ? s.filter      : g.filter;
+  out.eq          = s.enabled.eq          ? s.eq          : g.eq;
+  out.envelope    = s.enabled.envelope    ? s.envelope    : g.envelope;
+  out.driveDb     = s.enabled.driveDb     ? s.driveDb     : g.driveDb;
+  out.reverbMix   = s.enabled.reverbMix   ? s.reverbMix   : g.reverbMix;
+  out.pan         = s.enabled.pan         ? s.pan         : g.pan;
+  out.loopRegion  = s.enabled.loopRegion  ? s.loopRegion  : g.loopRegion;
+  return out;
+}
+```
+
+Two consequences worth calling out:
+
+1. **Sticky overrides.** If a slice overrides Tone and the user
+   later edits the global Tone, the slice's Tone **stays pinned**
+   at its override value (open UI question #9). This matches
+   Mimic and is defensible: the user opted the slice in for a
+   reason.
+2. **No mid-edit clicks.** The message thread pushes parameter
+   changes into `SampleFxState` (atomic fields); the audio thread
+   reads the atomics on every block. A knob-twiddle on a knob
+   that's bound to a `SliceOverride` flips that override's
+   `enabled` flag on first edit (so the override and the knob
+   value agree), then writes the new value into the override.
+
+The `↺ All` chip in the PadBank (`SamplerScreen`) clears every
+slice's `enabled` flag, returning all bindings to the global
+state. This is the inverse of "sticky overrides" — a one-shot
+"undo my per-slice edits" affordance, also matching QS.
 
 ### `audio/engine/` — RT-safe
 
@@ -66,14 +110,25 @@ Two products, one core. The **Spawn Core** is a static library that holds the au
 - `SampleCache` — LRU cache of decoded samples
 - `StreamingSamplePlayer` — disk-streaming for very long samples (stretch)
 
+### `audio/fx/` *(new in M2)*
+
+- `SampleFxGraph` — fixed-order FX chain for a single voice: `source → Tone → Filter → EQ → Envelope (amp-only) → Drive → Reverb → Pan → MasterGain → Out`. Reused wholesale by M3's per-pad performance voices.
+- `SampleFxState` — RT-safe mirror of the model: each FX parameter is an atomic field populated from the message thread when the user edits a knob. The graph reads only these atomics in its `process()`; it never touches the model directly.
+- `LoopRegion` *(mirrors `core/model/LoopRegion`)* — `[loopStart, loopEnd, crossfade, mode]` in source samples; consumed inside `PreviewEngine::getNextAudioBlock`.
+
 ### `audio/dsp/`
 
-- `ADSRahdsr` — amplitude envelope
-- `BiquadFilter` — SVF / LPF / HPF / BPF / Notch
-- `LFO` — sine / tri / saw / square / S&H
-- `Drive` — soft clip, fold-back
-- `PitchShifter` — phase vocoder / granular
-- `TimeStretcher` — wraps Rubber Band / ZTX / DIY
+- `BiquadFilter` — LP / HP / BP / Notch with parameter smoothing
+- `Tone` — bipolar tilt, three snap zones (Mellow / Neutral / Bright)
+- `TiltEq` — three gain shelves (Low @ 200 Hz / Mid @ 1 kHz / High @ 5 kHz), ±12 dB each
+- `Reverb` — Freeverb, wet-only knob
+- `Adsr` — full ADSR, retriggerable, sample-rate-derived coefs
+- `Drive` — soft-clip, dB knob
+- `Pan` — equal-power, mono
+- `LFO` — sine / tri / saw / square / S&H *(M3 stretch)*
+- `ADSRahdsr` — retained as alias of `Adsr` for backward-compatibility *(deprecate in M3)*
+- `PitchShifter` — phase vocoder / granular *(M3 stretch)*
+- `TimeStretcher` — wraps Rubber Band / ZTX / DIY *(M5)*
 - `Meter` — peak / RMS / LUFS
 
 ### `audio/effects/`
@@ -98,10 +153,11 @@ Two products, one core. The **Spawn Core** is a static library that holds the au
 
 ### `dsp/slicer/`
 
-- `Slicer` — manual + grid + transient + learn
-- `TransientDetector` — wraps aubio onset detector
-- `GridSlicer` — divides by BPM / bar
-- `LearnSlicer` — auto-detects slice points (transient + grid hybrid)
+- `Slicer` — public entry point covering all four modes (Off / Transients / Quick / Optimized)
+- `TransientDetector` — wraps `aubio_onset_t` (1024/256 window/hop)
+- `GridSlicer` — divides by BPM / bar (via `Clock` + `BarMath`)
+- `LearnSlicer` — auto-detects slice points (`aubio_tempo_t` confidence + onset-grid coherence hybrid)
+- All four run on a single-thread `juce::ThreadPool` worker. Generation-counter cancellation: a newer `sliceAsync` cancels any in-flight one (stale result dropped on the message thread).
 
 ### `dsp/warp/`
 
@@ -140,14 +196,16 @@ uses them, not in `Main.cpp`.
 
 Planned (later milestones):
 
-- `SamplerView` — waveform + pad grid + slice map
-- `SliceEditor` — per-slice envelope, pitch, pan, FX
-- `SequencerView` — step grid + track lanes
-- `MixerView` — channels + sends + master
-- `FXRackView` — insert chains (per-pad + master)
-- `BrowserView` — samples, presets, kits
-- `TransportBar` — play/stop, BPM, position, sync
-- `ModulationMatrixView` (stretch) — LFO + source/dest routing
+- `SamplerScreen` *(M2, lands this milestone)* — owns KnobPanel + PadBank + mode-chip strip; replaces the 4-placeholder knob row underneath the Display.
+- `KnobPanel` *(M2)* — vertical stack of eight FX groups; binds to global Kit FX or per-slice `SliceOverrides` depending on PadBank selection.
+- `EnvelopeView` *(M2)* — line/display ADSR with four drag handles.
+- `PadBank` *(M2 ships Slice mode only; Performance mode is M3)*
+- `LoopRegionOverlay` *(M2.3)* — drawn on the waveform's main editor at the existing marker layer; dashed brackets differ from solid cut markers.
+- `SequencerView` *(M6)* — step grid + track lanes
+- `MixerView` *(M4)* — channels + sends + master
+- `FXRackView` *(M4)* — master insert chains
+- `BrowserView` *(M8 stretch)* — samples, presets, kits
+- `ModulationMatrixView` *(M3 stretch)* — LFO + source/dest routing
 
 #### UI shutdown teardown order
 
@@ -205,22 +263,34 @@ MIDI in / pad click / sequencer step
 
 ## Latency budget
 
+M2 single-voice render path (per sample frame at 48 kHz, 256-block):
+
 | Stage | Budget |
 | --- | --- |
-| MIDI in → voice trigger | < 0.5 ms |
-| Voice render + samples | < 1 ms |
-| Per-pad FX | < 0.5 ms |
-| Mixer | < 0.5 ms |
-| Master FX | < 1 ms |
+| Loop-mode crossfade mix | < 0.05 ms (small mix buffer) |
+| Tone + Filter + EQ (sample-level) | < 0.3 ms |
+| ADSR (per-voice stage) | < 0.05 ms |
+| Drive + Reverb (Freeverb comb filters) | < 0.5 ms |
+| Pan + MasterGain | < 0.05 ms |
+| Source-sample → device-sample resample | < 0.05 ms (JUCE built-in) |
+| **Total voice** | **< 1 ms** |
+
+M3 multi-voice path (VoicePool with up to 64 voices):
+
+| Stage | Budget |
+| --- | --- |
+| Per-voice render (above) × active voices | < 0.5 ms (DSP) |
+| Voice mixdown to stereo bus | < 0.05 ms |
+| Master FX (M4) | < 1 ms |
 | Output | < 0.5 ms |
-| **Total round-trip** | **< 4 ms** |
+| **Total round-trip at 48 kHz** | **< 5 ms** (matches PROJECT.md § DSP latency budget) |
 
 ## File formats
 
-- **`.spawnproj`** — project file (JSON metadata + zip of sample cache)
-- **`.spawnkit`** — kit preset (just the slices + pads, no pattern)
+- **`.spawnproj`** — project file (JSON metadata; sample **embedded by default** with a per-project "External" toggle that stores only a path reference)
+- **`.spawnkit`** — kit preset (just the slices + pads, no pattern) *(M8 stretch)*
 - **`.spawnwave`** — exported audio
-- **`.spawnslice`** — slice preset (single-slice settings)
+- **`.spawnslice`** — slice preset (single-slice overrides + a sample ref) *(M8 stretch)*
 
 ## Memory strategy
 
@@ -239,10 +309,12 @@ Both wrap the same Core. Differences:
 ## Open architectural questions
 
 1. Audio thread priority: realtime FIFO on Linux / MMCSS on Windows?
-2. Voice stealing: oldest vs quietest vs closest-to-end?
-3. Per-pad effects vs per-track effects vs both?
-4. Pattern storage: flat array vs linked list (for song mode)?
-5. Song mode in v1 or v2?
-6. Project file format: JSON-only vs ZTX-bundled-binary?
-7. Convolution IR storage: bundled vs per-kit?
-8. Audio bus routing matrix (sends) for v1 or stretch?
+2. Voice stealing: oldest vs quietest vs closest-to-end? *(M3 when VoicePool lands)*
+3. Per-pad effects vs per-track effects vs both? — **resolved 2026-10-19**: per-pad M3, master-track M4. The M2 sample-level FX graph is shared wholesale across both, so the same DSP code reads as both.
+4. Pattern storage: flat array vs linked list (for song mode)? *(M6)*
+5. Song mode in v1 or v2? *(stretch)*
+6. Project file format: JSON-only vs ZTX-bundled-binary? — **resolved 2026-10-19**: JSON with embedded-by-default sample; external toggle stores path-only.
+7. Convolution IR storage: bundled vs per-kit? *(M4)*
+8. Audio bus routing matrix (sends) for v1 or stretch? *(M4 stretch)*
+9. M2.3 loop crossfade buffer size: 64 samples (~ 1.3 ms @ 48 kHz) is the proposed default. Larger = smoother, smaller = lower latency. Confirm at PR review.
+10. M2.1 envelope node: amp-only (locked) vs any-parameter modulation *(M3 stretch — modulation matrix)*.

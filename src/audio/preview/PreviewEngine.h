@@ -39,12 +39,57 @@ public:
     PreviewEngine();
     ~PreviewEngine() override;
 
+    // Replace the engine's playing buffer. The buffer is published
+    // as-is (no time-stretch); the caller is responsible for handing
+    // in audio that's already at the engine's current target BPM.
+    // Use setSourceBuffer() when the audio carries a different
+    // tempo than the engine's current target.
+    //
     // Decoded stereo buffer plus its native sample rate. The engine
     // remembers the buffer (by shared_ptr) and the sample rate; the
     // device's actual rate is set up at prepareToPlay() time and any
     // mismatch is handled by JUCE's resampler when needed.
     void setBuffer(std::shared_ptr<const juce::AudioBuffer<float>> buffer,
                    double sourceSampleRate);
+
+    // Replace the engine's playing buffer AND tell the engine what
+    // tempo the buffer is natively encoded at. The engine immediately
+    // re-stretches the buffer through spawn::dsp::TimeStretcher to
+    // its current target BPM (initially 120; see setTargetBpm()),
+    // publishes the stretched result as the playing buffer, and
+    // records sourceBpm for any future setTargetBpm() calls.
+    //
+    // `sourceBpm` <= 0 is treated as identity (no stretch) —
+    // degenerate input never makes the engine slower just because a
+    // caller passed a 0 for the third argument.
+    //
+    // Synchronous; intended for the message thread (file-load path).
+    void setSourceBuffer(std::shared_ptr<const juce::AudioBuffer<float>> buffer,
+                         double sourceSampleRate,
+                         double sourceBpm);
+
+    // Change the engine's playback tempo. The engine re-stretches
+    // the source buffer (set via setSourceBuffer) to match the new
+    // BPM and atomically publishes the result. If no source buffer
+    // has been set (every setBuffer() call so far was a derived
+    // buffer), the call is a no-op — there's nothing to re-stretch.
+    //
+    // Re-stretching is synchronous on the calling thread (typically
+    // the message thread). A 10-second stereo loop at 48 kHz bakes
+    // in well under a second on commodity hardware; the user is
+    // editing the BPM field, not playing a pad.
+    //
+    // `targetBpm` is clamped to dsp::Clock::[BpmMin, BpmMax] so the
+    // engine never reads nonsense from a downstream caller.
+    void setTargetBpm(double targetBpm);
+
+    // Currently-loaded source BPM, or 0.0 if no source has been
+    // recorded yet (engine after construction, or after only
+    // setBuffer / setBufferFromChops calls). The "source BPM" is
+    // the BPM the loaded audio is natively encoded at — the engine's
+    // playing buffer may be at a different (target) BPM after a
+    // setTargetBpm re-bake.
+    double getSourceBpm() const noexcept;
 
     // Start playback at startSeconds, end at endSeconds. If the engine
     // is already playing this is a re-trigger (the position is reset
@@ -244,6 +289,33 @@ private:
 
     std::atomic<int64_t> totalSourceSamples{0};
     std::atomic<double>  sourceSampleRate{0.0};
+
+    // The engine tracks two buffers when a tempo origin is known:
+    //   sourceBuffer_    — the audio at its native BPM
+    //                       (the buffer set by setSourceBuffer), kept
+    //                       around so we can re-bake on BPM changes.
+    //   bufferRef (setBuffer path) — the buffer as it stands today,
+    //                       already at the engine's targetBpm. This
+    //                       is the one the audio thread plays.
+    //
+    // sourceBpm_ and targetBpm_ are stored as std::atomic<double> so
+    // querying them from the audio thread is lock-free. They are
+    // both 0 until setSourceBuffer() has been called at least once
+    // — a pure-setBuffer-only engine stays at 0/0 and re-bakes are
+    // no-ops (we can't stretch a buffer whose origin tempo we
+    // don't know).
+    mutable std::mutex sourceMutex;
+    std::shared_ptr<const juce::AudioBuffer<float>> sourceBuffer;
+    std::atomic<double> sourceBpm{0.0};
+    std::atomic<double> targetBpm{120.0};
+
+    // Re-bake sourceBuffer_ to the current targetBpm_ and publish
+    // the result via setBuffer(). No-op when sourceBuffer_ is null
+    // (nothing to re-bake) or when the ratio would be 1 (we still
+    // publish, since the publish is what the audio thread observes,
+    // but we skip the WSOLA pass and publish the source directly).
+    // Synchronous; message thread.
+    void rebake();
 
     // Per-block scratch: device sample rate + block size, written by
     // prepareToPlay (audio thread context for live devices, but the

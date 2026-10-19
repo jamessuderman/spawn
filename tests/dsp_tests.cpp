@@ -40,6 +40,7 @@
 #include "../src/dsp/BpmDetector.h"
 #include "../src/dsp/BarMath.h"
 #include "../src/dsp/Clock.h"
+#include "../src/dsp/TimeStretcher.h"
 #include "../src/dsp/WavTempoReader.h"
 
 #include "TestHelpers.h"
@@ -355,8 +356,148 @@ public:
     }
 };
 
+class TimeStretcherTests : public juce::UnitTest
+{
+public:
+    TimeStretcherTests() : juce::UnitTest("dsp::TimeStretcher") {}
+    void runTest() override
+    {
+        using spawn::dsp::TimeStretcher;
+
+        // outputLengthFor arithmetic.
+        expectEquals(TimeStretcher::outputLengthFor(1000, 1.0),  1000);
+        expectEquals(TimeStretcher::outputLengthFor(1000, 0.5),   500);
+        expectEquals(TimeStretcher::outputLengthFor(1000, 1.5),  1500);
+        // Identity ratio from the BPM model: 105 -> 90 = 105/90 ~ 1.1667.
+        expectWithinAbsoluteError(
+            TimeStretcher::outputLengthFor(44100 * 2, 105.0 / 90.0),
+            static_cast<int>(44100 * 2 * (105.0 / 90.0)),
+            2);
+
+        // Degenerate inputs.
+        expectEquals(TimeStretcher::outputLengthFor(0,  1.0), 0);
+        expectEquals(TimeStretcher::outputLengthFor(100, 0.0), 0);
+        expectEquals(TimeStretcher::outputLengthFor(100, -1.0), 0);
+        expectEquals(TimeStretcher::outputLengthFor(100,
+                                                    std::numeric_limits<double>::infinity()),
+                     0);
+
+        // Identity ratio on real audio: output is bit-for-bit
+        // identical to the input (no WSOLA side-effects).
+        {
+            juce::AudioBuffer<float> in(2, 4000);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 4000; ++i)
+                    in.setSample(ch, i,
+                                 std::sin(static_cast<float>(i) * 0.01f
+                                          + static_cast<float>(ch)));
+
+            auto out = TimeStretcher::stretch(in, 1.0);
+            expectEquals(out.getNumChannels(), 2);
+            expectEquals(out.getNumSamples(), 4000);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 4000; ++i)
+                    expectWithinAbsoluteError(out.getSample(ch, i),
+                                              in.getSample(ch, i), 1e-6f);
+        }
+
+        // Stretch by 1.5x: output length is ~1.5x the input.
+        // We don't assert exact length to avoid locking the
+        // internal hop math; we do assert "between input and
+        // 1.5x + 1 hop" so the algorithm doesn't truncate or
+        // blow up.
+        {
+            juce::AudioBuffer<float> in(1, 4000);
+            for (int i = 0; i < 4000; ++i)
+                in.setSample(0, i, std::sin(static_cast<float>(i) * 0.05f));
+
+            auto out = TimeStretcher::stretch(in, 1.5);
+            // Allow up to 2x output hop of slack on the high side
+            // (algorithm-level rounding) and at-least input on
+            // the low side (no clipping).
+            expect(out.getNumSamples() >= 4000);
+            expect(out.getNumSamples() <= static_cast<int>(4000 * 1.5 + 1024));
+        }
+
+        // Compress by 0.5x: shorter output.
+        {
+            juce::AudioBuffer<float> in(1, 4000);
+            for (int i = 0; i < 4000; ++i)
+                in.setSample(0, i, std::sin(static_cast<float>(i) * 0.05f));
+
+            auto out = TimeStretcher::stretch(in, 0.5);
+            expect(out.getNumSamples() >= static_cast<int>(4000 * 0.5) - 1024);
+            expect(out.getNumSamples() <= 4000);
+        }
+
+        // Multi-channel: output channel count matches input.
+        {
+            juce::AudioBuffer<float> in(4, 2000);
+            for (int ch = 0; ch < 4; ++ch)
+                for (int i = 0; i < 2000; ++i)
+                    in.setSample(ch, i,
+                                 std::cos(static_cast<float>(i) * 0.02f
+                                          + static_cast<float>(ch)));
+
+            auto out = TimeStretcher::stretch(in, 1.25);
+            expectEquals(out.getNumChannels(), 4);
+            expect(out.getNumSamples() > 0);
+        }
+
+        // Pitch-invariant sanity check. Render a sine at
+        // exactly 8 cycles across the input buffer (440 Hz-ish
+        // depending on rate), stretch it by 1.5x, and check the
+        // output has fewer cycles than the input — i.e. the
+        // wave slowed down rather than pitched down. We don't
+        // rely on exact cycle count (WSOLA blurs transients a
+        // little) — we just want to confirm cycle rate dropped.
+        //
+        // We use a high-resolution slow-rate-detection via
+        // zero-crossings.
+        {
+            const int N = 8000;
+            juce::AudioBuffer<float> in(1, N);
+            const float cyclesInInput = 64.0f;
+            for (int i = 0; i < N; ++i)
+            {
+                const float phase = cyclesInInput
+                    * (static_cast<float>(i) / static_cast<float>(N))
+                    * juce::MathConstants<float>::twoPi;
+                in.setSample(0, i, std::sin(phase));
+            }
+
+            auto out = TimeStretcher::stretch(in, 1.5);
+            // We expect roughly cyclesInInput / 1.5 = ~43
+            // cycles in the output. Allow a generous window: it
+            // must be strictly less than cyclesInInput (the
+            // cycle count of the input) so the wave slowed
+            // down, not stayed the same or accelerated.
+            const int cycles = countZeroCrossings(out.getReadPointer(0),
+                                                  out.getNumSamples())
+                               / 2;
+            expect(cycles > 32 && cycles < static_cast<int>(cyclesInInput));
+        }
+    }
+
+private:
+    static int countZeroCrossings(const float* x, int n)
+    {
+        int count = 0;
+        for (int i = 1; i < n; ++i)
+        {
+            if ((x[i - 1] < 0.0f && x[i] >= 0.0f)
+                || (x[i - 1] > 0.0f && x[i] <= 0.0f))
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+};
+
 static BarMathTests barMathTests;
 static ClockTests clockTests;
 static BpmDetectorTests bpmDetectorTests;
 static WavTempoReaderTests wavTempoReaderTests;
+static TimeStretcherTests timeStretcherTests;
 

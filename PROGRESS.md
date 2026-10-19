@@ -1,8 +1,10 @@
 # Spawn — Progress
 
-## Status: M1 in progress
+## Status: M2 planning complete, ready to begin
 
-M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, fonts, icons, drag-and-drop waveform view, and Mimic-style overview/main strip are in. Slice editing, sample decode-to-RAM, and project save/load are still ahead.
+M0 (project setup + standalone skeleton) is done. M1 (drag-drop waveform, Speaker + Scissors, transport row, BPM detect, TempoInspector) is done. M1.5 (BPM detection, Clock, sample-level warp MVP scaffold) is done.
+
+M2 has been replanned around a **1:1 Apple Logic Pro Quick Sampler surface** (sample-level FX, four slice modes, per-slice overrides). M3+ (per-pad performance, FX rack reorder, sequencer, VST3) are unchanged in their position. No code lands for M2 until each subtask has its granular PR plan agreed.
 
 ## Milestone breakdown
 
@@ -30,14 +32,84 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - [x] **Transport row** (M1 → M1): four icon-only chips (Play / Stop / Pause / Loop) sit in the same row as the display buttons in the header, pushed right next to the volume knob. Play calls `engine.playFrom(startSeconds, endSeconds)` — i.e., from the chop start marker to the end of the loaded buffer, bypassing any chop list (the Speaker tool still owns chop playback). Stop calls `engine.stop()` then `engine.setPlayheadSeconds(startSeconds)` so the playhead returns to the start marker. Pause calls `engine.pause()` (silence without rewinding). Loop is a sticky toggle that mirrors into `engine.setLoopEnabled(true)`; `getNextAudioBlock` rewinds to `startSample` and keeps `playing=true` when the playhead reaches `endSample` and the flag is on, so the loop wraps whatever window is currently armed (whole audio from a Play press, or an individual chop from a Speaker click). Loop state is preserved across Stop, Pause, setBuffer and trimToRegion so the user's preference sticks.
 - [ ] Project save/load (JSON)
 
-### M2 — Slicer + pad grid *(week 3-4)*
+### M2 — Quick Sampler surface *(weeks 3-5)*
 
-- [ ] Manual slicing (drag markers on waveform)
-- [ ] Grid slicing (BPM-based)
-- [ ] Transient slicing (aubio)
-- [ ] Learn slicing (auto)
-- [ ] 4×4 pad grid (click → play slice)
-- [ ] Choke groups, mute/solo, mute groups
+**Re-scoped 2026-10-19 per James's "1:1 Logic Pro Quick Sampler" brief.** The M2 scope moved from "slicer + 4×4 pad grid with choke/mute" to a sample-level, single-voice Quick Sampler surface (filter / EQ / Reverb / Pitch / Envelope / Loop, four slice modes, per-slice overrides). The 4×4 grid + choke/mute code is deferred to M3 (per-pad performance).
+
+**M2.0 — Core models**
+- [ ] `core/model/Sample.{h,cpp}` — file ref, sample rate, length, channels, root note, fine tune, pitch semitones
+- [ ] `core/model/Envelope.{h,cpp}` — full ADSR (attack / decay / sustain / release)
+- [ ] `core/model/LoopRegion.{h,cpp}` — start, length, crossfade, mode (`Off`, `Forward`, `BackAndForth`)
+- [ ] `core/model/SliceOverrides.{h,cpp}` — `enabled` toggle plus every FX field
+- [ ] `core/model/Slice.{h,cpp}` — source start/end, fade in/out, `SliceOverrides`
+- [ ] `core/model/Kit.{h,cpp}` — sample, slices, global FX state, master gain
+- [ ] Round-trip JSON tests (roll-our-own `JsonHelpers`, no `nlohmann/json`)
+
+**M2.1 — DSP blocks** (pulled forward from M3, all RT-safe)
+- [ ] `dsp/BiquadFilter` — LP / HP / BP / Notch with parameter smoothing
+- [ ] `dsp/Tone` — bipolar tilt (snap zones at ±0.5: Mellow / Neutral / Bright)
+- [ ] `dsp/TiltEq` — three gain shelves (200 Hz / 1 kHz / 5 kHz)
+- [ ] `dsp/Reverb` — Freeverb, wet-only
+- [ ] `dsp/Adsr` — full ADSR, retriggerable
+- [ ] `dsp/Drive` — soft-clip, dB knob
+- [ ] `dsp/Pan` — equal-power
+
+**M2.2 — `SampleFxGraph` + `SampleFxState`**
+- [ ] `audio/fx/SampleFxGraph` — fixed-order `source → Tone → Filter → EQ → Envelope (amp) → Drive → Reverb → Pan → MasterGain`
+- [ ] `audio/fx/SampleFxState` — RT-safe mirror of the model, populated from message thread
+- [ ] Engine integration: `PreviewEngine::setFxState` so the audio thread sees RT-safe values
+- [ ] Per-slice override resolution at the input of the graph (slice pulls overrides, falls back to global)
+
+**M2.3 — Loop engine (Forward + BackAndForth)**
+- [ ] Widen `PreviewEngine::TransportState` to carry loop region (`loopStart`, `loopEnd`, `mode`, `crossfade`)
+- [ ] Audio-thread branch in `getNextAudioBlock` for crossfade loop + ping-pong
+- [ ] "Lock to region" toggle (decouples start/end from loop range)
+- [ ] Unit test on a 4-bar synth loop through both modes
+
+**M2.4 — `Slicer` + four modes**
+- [ ] `dsp/slicer/TransientDetector` — wraps `aubio_onset_t` (1024 / 256)
+- [ ] `dsp/slicer/GridSlicer` — N equal slices via Clock / BarMath
+- [ ] `dsp/slicer/LearnSlicer` — confidence-gated hybrid (transients-when-confident, grid-otherwise)
+- [ ] `dsp/slicer/Slicer` — public entry point covering all four modes
+- [ ] Generation-counter cancellation pattern (mirrors `TempoInspector`)
+- [ ] Quick Sampler parity modes: **Off** / **Transients** / **Quick** / **Optimized**
+- [ ] Slice-count slider 1–64 (visible only in Quick mode)
+
+**M2.5 — `EnvelopeView`**
+- [ ] `ui/envelope/EnvelopeView.{h,cpp}` — line/display style, matches WaveformView's filled-from-centre Mimic idiom
+- [ ] Four drag handles (A / D / S / R), ember grab-handle matching waveform marker drag
+- [ ] Public Sans SemiBold 12 px uppercase section title above the editor
+- [ ] Signal-curve follows the actual ADSR coefs in real time
+
+**M2.6 — `KnobPanel`**
+- [ ] Vertical stack of groups: TONE / PITCH / FILTER / EQ / ENVELOPE / AMP / PAN / LOOP
+- [ ] Header titles per spec (Public Sans SemiBold 12 px uppercase, +2% letter-spacing)
+- [ ] Per-group `disabled` state (in Off mode: Tone / Pitch / Amp / Pan enabled, Filter / EQ / Reverb dim, Envelope active, Loop dim)
+- [ ] `Knob` already supports double-click reset and Shift-fine (per existing `Knob.h:8-11`); `KnobPanel` adds the alt-fine dispatch via the OS `AltModifier`
+- [ ] Tone knob: 3 snap zones (Mellow < −0.5 / Neutral / Bright > +0.5)
+
+**M2.7 — `PadBank` with `Mode`**
+- [ ] `ui/padgrid/PadBank.{h,cpp}` with `Mode { Slice, Performance }`
+- [ ] Slice mode only in M2: single-selection row (1×N, default 16; 1–64 range)
+- [ ] Performance mode greyed-out chip in the section header (deferred to M3)
+- [ ] Selection chip: "↺ All" (edits global FX) and a per-slice label
+
+**M2.8 — `SamplerScreen`**
+- [ ] `samplecontrols/SamplerScreen.{h,cpp}` — owns KnobPanel, PadBank, mode-chip strip, loop-region overlay
+- [ ] Layout: top = Display (waveform), bottom = SamplerScreen (knobs right, pads left, mode chips mid-left)
+- [ ] Window-resize behaviour: knobs compress vertically (group titles stay pinned), pad row holds 16:1 aspect
+
+**M2.9 — Project model + persistence**
+- [ ] `project/Project.{h,cpp}` — sample ref + Kit + master state
+- [ ] `project/ProjectStore.{h,cpp}` — `.spawnproj` JSON (embedded sample by default, "External" toggle saves path instead)
+- [ ] "Extract" action: project → new project with only the selected slice + its overrides
+- [ ] Round-trip tests against the model
+
+**M2.10 — Polish**
+- [ ] Keyboard shortcuts (Tab cycles KnobPanel → PadBank, arrows scrub selected knob, Space plays, Cmd/Ctrl-S saves)
+- [ ] Empty-state copy
+- [ ] Drag-hover affordance on the waveform's main editor (UI question #12)
+- [ ] Per-module manual page
 
 ### M1.5 — Tempo + bars foundation *(early M2 prerequisite)* 🟡
 
@@ -56,59 +128,61 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - [ ] Warp MVP (per-sample stretch to target BPM; uses Rubber Band once vendored)
 - [ ] Rounded corners on the BPM and Bars editors (currently flat dark-ink rectangles — close to spec but the corner-radius bit is a follow-up)
 
-### M3 — Envelopes + per-pad FX *(week 5)*
+### M3 — Performance + per-pad FX *(weeks 6-8)*
 
-- [ ] AHDSR envelope per slice
-- [ ] Biquad filter per slice
-- [ ] LFO per slice
-- [ ] Drive per slice
-- [ ] Per-pad FX insert chain
+> Originally scoped as "Envelopes + per-pad FX". With M2's sample-level FX graph now in place, M3's DSP work shrinks to **per-pad instantiation of `SampleFxGraph`** plus the deferred performance surface. The per-slice knobs / per-pad FX chain that previously lived here now reuse the M2 graph wholesale — DSP code lands once in M2.1, M3 instantiates it on each pad voice.
+
+- [ ] 4×4 pad grid with click-to-trigger and choke groups (deferred from M2)
+- [ ] `PadBank::Mode::Performance` enabled (chip toggle in section header)
+- [ ] Per-pad `SampleFxGraph` (DSP code reused from M2.1)
+- [ ] Pad-trigger flash (UI question #7)
+- [ ] Pad-level choke / mute groups
 - [ ] Modulation matrix *(stretch)*
 
-### M4 — Master FX + mixer *(week 6)*
+### M4 — Mixer + master FX *(week 9)*
 
-- [ ] Master EQ (4-band)
-- [ ] Master compressor
-- [ ] Master reverb (convolution)
-- [ ] Master delay (sync)
-- [ ] Master limiter
-- [ ] Mixer view
+> Master FX render in series after all voices. The graph is per-strip / per-master, NOT per-sample — that pattern doesn't fit the in-voice model M2 built. M4 inherits `Reverb` (Freeverb) from M2.1 but treats master reverb as a parallel return.
 
-### M5 — Time-stretch + warp *(week 7-8)*
+- [ ] Mixer view (channel strips, sends, master)
+- [ ] Master EQ (4-band) — independent of the M2 EQ tilt
+- [ ] Master compressor (feed-forward, soft-knee)
+- [ ] Master reverb (parallel return, Freeverb carry-over)
+- [ ] Master delay (sync, ping-pong)
+- [ ] Master limiter (lookahead brickwall)
 
-- [ ] Time-stretch with pitch preserved (Rubber Band)
-- [ ] Warp mode (beat-locked)
+### M5 — Stretch + warp *(weeks 10-12)*
+
+- [ ] Time-stretch with pitch preserved (Rubber Band vendor)
+- [ ] Warp mode (beat-locked) — feeds M2's loop engine
 - [ ] Per-slice stretch UI
 - [ ] Stretch quality modes (low / med / high / realtime)
 
-### M6 — Sequencer *(week 9-11)*
+### M6 — Sequencer *(weeks 13-15)*
 
-- [ ] Step grid
-- [ ] Multiple tracks (per pad)
+- [ ] Step grid (16 / 32 steps, multi-track, per-track length)
+- [ ] Per-track instrument routing (pad-bound)
 - [ ] Pattern length per track
 - [ ] Swing, micro-timing, repeats
 - [ ] Pattern chaining *(stretch: song mode)*
 
-### M7 — Transport + sync *(week 12)*
+### M7 — Transport + sync *(week 16)*
 
 - [ ] MIDI clock in/out
 - [ ] Audio clock in *(stretch)*
 - [ ] Latency compensation
 - [ ] Metronome
 
-### M8 — Polish + VST3 *(week 13-14)*
+### M8 — VST3 + state *(weeks 17-18)*
 
-- [ ] VST3 plugin format
+- [ ] VST3 plugin format (every automatable parameter exposed)
 - [ ] DAW automation
-- [ ] State save/load
+- [ ] State save/load (delegates to the M2.9 `ProjectStore`)
 - [ ] Theme + UI polish
-- [ ] Onboarding
 
-### M9 — Beta *(week 15-16)*
+### M9 — Beta + ship *(weeks 19-20)*
 
-- [ ] Internal beta
-- [ ] Bug bash
-- [ ] Documentation
+- [ ] Internal beta + bug bash
+- [ ] Documentation (manual + README)
 - [ ] Installer (Windows / macOS)
 
 ## Decisions log
@@ -129,6 +203,33 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 - **Time-stretch**: TBD (Rubber Band default).
 - **Transient detection**: aubio (BSD), vendored at `third_party/aubio` (git submodule). Wrapped via `cmake/SpawnAubio.cmake` — we build only the C sources needed for `aubio_tempo_t` (BPM) and `aubio_onset_t` (transient slicing, planned M2) as a STATIC library, skipping aubio's I/O / effects / synth / pitch subsystems and all optional FFT backends. Builds with the OOURA portable FFT, single-precision (`HAVE_AUBIO_DOUBLE=0`), with MSVC's NULL macro re-supplied via `config.h`.
 - **BPM detection**: aubio's tempo tracker (`aubio_tempo_t`, 1024/256 window/hop, defaults matching `aubio beat` CLI). Returns `{bpm, confidence}`. v1 wraps it as `spawn::dsp::BpmDetector`; v2 may add transient slicing on the same library once M2 begins.
+
+### M2 re-sequence decisions (2026-10-19)
+
+The M2 milestone was re-scoped from "slicer + 4×4 pad grid + choke/mute" to a **1:1 Apple Logic Pro Quick Sampler surface** (single-voice, sample-level FX, four slice modes, per-slice overrides). The 4×4 pad grid + choke/mute work was deferred to M3 — Performance mode coexists with M2's Slice mode through a `PadBank::Mode` toggle, which lets both ship cleanly.
+
+- **M2 re-scoped**: Quick Sampler surface (single voice, 8 FX modules, 4 slicing modes, per-slice override model). 4×4 pad grid + choke groups deferred to M3.
+- **Slice modes ship as**: **Off** / **Transients** (aubio onset) / **Quick** (BPM-aware grid, slice count 1–64) / **Optimized** (transients-when-confident, grid-otherwise). Names held; "Optimized" → "Smart / Auto" is a v2 brand refactor, not v1.
+- **FX graph order is fixed**: `source → Tone → Filter → EQ → Envelope (amp-only) → Drive → Reverb (wet only) → Pan → MasterGain → Out`. No FX rack reorder in M2; M4 introduces a graph that can rearrange for master FX.
+- **Envelope is full ADSR** (not AR-only). Sustain is a knob, just like A/D/R. The DSP block is `spawn::dsp::Adsr`.
+- **Loop modes ship as Forward + BackAndForth** (both, in M2). Hard-edge loop is the `Off` mode of the same `LoopRegion`. Crossfade mixes the loop edges for both modes.
+- **Loop UI** lives on the waveform (loop-bracket overlay matching start/end markers, transport row has a "L" toggle to reveal brackets). Loop is dimmed in Off slice mode.
+- **Per-slice override model**: every DSP parameter on the global FX state has a per-slice mirror in `SliceOverrides`. The `enabled` flag on each field lets slices opt into overriding a subset (e.g. one slice overrides Pitch only). Defaults inherit from the global FX state. The PadBank's `↺ All` chip clears every per-slice override.
+- **Tone knob**: continuous bipolar tilt in `[-1, +1]` with three snap zones (Mellow < −0.5, Neutral, Bright > +0.5). Rendered by `Knob` as faint zone markers; click-and-drag snaps to the zone centre once the cursor crosses the threshold.
+- **Reverb**: Freeverb, wet-only knob — no decay or room-size in M2.
+- **Pitch knob**: a 2-axis control (semitones + fine cents, both ±12) plus root note. Per-slice override is `pitchSemitones` only in M2 (cents and root slot into a later override).
+- **Filter knob**: 1 knob for mode (LP / HP / BP / Notch) + 2 knobs for cutoff + resonance. Mode is a chip selection inside the group; cutoff + resonance are knobs.
+- **EQ**: three independent gain knobs (Low / Mid / High) at fixed-frequency shelves (200 Hz / 1 kHz / 5 kHz), each ±12 dB.
+- **Drive**: soft-clip, drive-dB knob. Per-sample and per-slice override.
+- **Pan**: equal-power, mono in the M2 model (`Pan::process(input, position)` returns one sample).
+- **Voice count**: single voice in M2 (matches QS). `VoicePool` / 64 voices lands in M3 with Performance mode.
+- **PadBank `Mode`**: `Slice` (default, single-select, drag handle preview, no triggering) and `Performance` (stub, greyed chip in M2). The Slice mode is the QS surface; Performance lights up in M3.
+- **Sliders / modes — UI ergonomics**: KnobPanel vertical on the right, PadBank horizontal at the bottom, mode-chip strip mid-left under the waveform. Same vertical column rule as the current window layout.
+- **Knob reset**: double-click resets to default; Alt+drag reduces sensitivity by 5x (matching the existing `Knob.h` Shift-fine convention, extended to Alt).
+- **Project save format**: true project model — `.spawnproj` JSON with embedded sample by default; "External" toggle in the save dialog stores the path instead. M2.9 owns this.
+- **Mode-chip behaviour**: re-clicking the active mode (Off in particular) clears existing slices with a confirm dialog if the user has manually moved a marker in the current session.
+- **Knob default reset is bound to the global FX state, not the per-slice override.** Double-clicking the Pitch knob while editing a slice resets to that slice's *default-pitch* (which is itself resolved from the global Pitch knob's value at slice creation time). Confirmed separately — the simpler model.
+
 - **License (source)**: TBD (MIT / dual).
 - **License (product)**: TBD (free / freemium / one-time / subscription).
 - **Open-source model**: TBD.
@@ -143,6 +244,8 @@ M0 (project setup + standalone skeleton) is done. M1 is mid-flight: the window, 
 6. **Song mode** — v1 or v2?
 7. **Audio-to-MIDI / beat assist** — v1 or v2?
 8. **Waveform zoom interaction** — click-and-drag-down to zoom a region (Mimic), scroll-wheel to zoom centred on cursor, or both? (Resolved when we wire M1's zoom/pan.)
+9. **Per-slice override collision rule** — if a slice overrides Tone but not Filter, the slice's Tone wins and Filter inherits the global value. If a slice overrides Tone and the global Tone changes, **does the slice's value follow or stay pinned?** (Plan currently ships "stays pinned".) Confirm.
+10. **M2.10 — open-source the `.spawnproj` schema** before M2.9 lands, or after? Schema spec is small either way, but sharing early lets third-party tools target us.
 
 ## Ideas backlog (v2+)
 

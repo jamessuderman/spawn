@@ -14,6 +14,7 @@
 #include <JuceHeader.h>
 
 #include "../src/audio/preview/PreviewEngine.h"
+#include "../src/dsp/Clock.h"
 
 using spawn::audio::PreviewEngine;
 
@@ -1012,3 +1013,94 @@ public:
 
 // The static instance registers the test with JUCE's UnitTestRunner.
 static PreviewEngineTests previewEngineTests;
+
+// Tempo-stretch integration: the engine's playing buffer length
+// scales with the BPM ratio (sourceBpm / targetBpm). Confirms the
+// WSOLA re-bake path used by Main.cpp's "edit BPM" wiring
+// produces a buffer of the expected length after both
+// setSourceBuffer(initial) and setTargetBpm(changed).
+class PreviewEngineTempoTests : public juce::UnitTest
+{
+public:
+    PreviewEngineTempoTests() : juce::UnitTest("PreviewEngine::tempo") {}
+    void runTest() override
+    {
+        using spawn::audio::PreviewEngine;
+
+        beginTest("setSourceBuffer bakes sourceBpm -> targetBpm");
+        {
+            PreviewEngine engine;
+
+            // 1-second constant buffer at 48000 Hz, source = 120 BPM.
+            const int N = 48000;
+            auto buf = std::make_shared<juce::AudioBuffer<float>>(2, N);
+            buf->clear();
+            for (int ch = 0; ch < buf->getNumChannels(); ++ch)
+                for (int i = 0; i < N; ++i)
+                    buf->setSample(ch, i, 0.5f);
+
+            engine.setSourceBuffer(buf, 48000.0, 120.0);
+            const int bufLenAt120 = engine.getBufferSnapshot()->getNumSamples();
+            // Source == target, ratio == 1, no stretch.
+            expectEquals(bufLenAt120, N);
+            expectEquals(engine.getSourceBpm(), 120.0);
+
+            // Slow down to 90 BPM: ratio = 120/90 = 1.333...
+            engine.setTargetBpm(90.0);
+            const int bufLenAt90 = engine.getBufferSnapshot()->getNumSamples();
+            expect(bufLenAt90 > bufLenAt120);
+            expectWithinAbsoluteError(static_cast<double>(bufLenAt90),
+                                      static_cast<double>(N) * 120.0 / 90.0,
+                                      200.0); // ~half a hop slack
+
+            // Speed up to 200 BPM: ratio = 120/200 = 0.6.
+            engine.setTargetBpm(200.0);
+            const int bufLenAt200 = engine.getBufferSnapshot()->getNumSamples();
+            expect(bufLenAt200 < bufLenAt90);
+            expect(bufLenAt200 < bufLenAt120);
+            expectWithinAbsoluteError(static_cast<double>(bufLenAt200),
+                                      static_cast<double>(N) * 120.0 / 200.0,
+                                      200.0);
+
+            // Back to 120 BPM: ratio == 1, identity.
+            engine.setTargetBpm(120.0);
+            const int bufLenBack = engine.getBufferSnapshot()->getNumSamples();
+            expectWithinAbsoluteError(static_cast<double>(bufLenBack),
+                                      static_cast<double>(N),
+                                      200.0);
+        }
+
+        beginTest("setSourceBuffer with degenerate sourceBpm is identity");
+        {
+            PreviewEngine engine;
+            const int N = 8000;
+            auto buf = std::make_shared<juce::AudioBuffer<float>>(2, N);
+            buf->clear();
+            engine.setSourceBuffer(buf, 48000.0, 0.0);
+            expectEquals(engine.getBufferSnapshot()->getNumSamples(), N);
+            expectEquals(engine.getSourceBpm(), 0.0);
+        }
+
+        beginTest("setTargetBpm clamps to Clock's BPM range");
+        {
+            PreviewEngine engine;
+            const int N = 48000;
+            auto buf = std::make_shared<juce::AudioBuffer<float>>(2, N);
+            buf->clear();
+            engine.setSourceBuffer(buf, 48000.0, 120.0);
+
+            engine.setTargetBpm(0.0);
+            expect(engine.getSourceBpm() == 120.0);
+            // Buffer unchanged (no-op due to degenerate input).
+            expectEquals(engine.getBufferSnapshot()->getNumSamples(), N);
+
+            engine.setTargetBpm(spawn::dsp::Clock::BpmMax + 1000.0);
+            // We can't easily read targetBpm from outside; assert
+            // it didn't crash and the engine is still in a sane
+            // state by checking it has a buffer.
+            expect(engine.hasBuffer());
+        }
+    }
+};
+
+static PreviewEngineTempoTests previewEngineTempoTests;

@@ -98,6 +98,12 @@ if(SPAWN_BUILD_STANDALONE)
             src/audio/preview/TempoInspector.cpp
             src/controlheader/ControlHeader.cpp
             src/controlheader/DisplayButton.cpp
+            src/core/model/Envelope.cpp
+            src/core/model/Kit.cpp
+            src/core/model/LoopRegion.cpp
+            src/core/model/Sample.cpp
+            src/core/model/Slice.cpp
+            src/core/model/SliceOverrides.cpp
             src/display/Display.cpp
             src/samplecontrols/MasterControls.cpp
             src/samplecontrols/SampleControls.cpp
@@ -119,6 +125,7 @@ if(SPAWN_BUILD_STANDALONE)
             src/dsp/BarMath.cpp
             src/dsp/BpmDetector.cpp
             src/dsp/Clock.cpp
+            src/dsp/TimeStretcher.cpp
             src/dsp/WavTempoReader.cpp
             src/waveform/ClipFadeRemap.cpp
             src/waveform/WaveformView.cpp)
@@ -184,12 +191,20 @@ if(SPAWN_BUILD_TESTS)
             tests/sample_decoder_tests.cpp
             tests/waveform_view_tests.cpp
             tests/dsp_tests.cpp
+            tests/core_model_tests.cpp
             src/audio/preview/PreviewEngine.cpp
             src/audio/preview/SampleDecoder.cpp
             src/audio/preview/TempoInspector.cpp
+            src/core/model/Envelope.cpp
+            src/core/model/Kit.cpp
+            src/core/model/LoopRegion.cpp
+            src/core/model/Sample.cpp
+            src/core/model/Slice.cpp
+            src/core/model/SliceOverrides.cpp
             src/dsp/BarMath.cpp
             src/dsp/BpmDetector.cpp
             src/dsp/Clock.cpp
+            src/dsp/TimeStretcher.cpp
             src/dsp/WavTempoReader.cpp
             src/stores/SettingsStore.cpp
             src/ui/fonts/Fonts.cpp
